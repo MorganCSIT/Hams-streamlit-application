@@ -2,3 +2,16 @@ __pycache__/
 *.pyc
 *.log
 .claude/
+.streamlit/secrets.toml
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+AuditReports/
+LTRReports/
+MergedReports/
+RDAReports/
+WebfleetReports/
+
+*.tar
+*.zip

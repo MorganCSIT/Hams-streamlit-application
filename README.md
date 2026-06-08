@@ -1,19 +1,25 @@
 # Webfleet Log Downloader
 
-Streamlit app for downloading Webfleet trip reports through the CSV API to a local folder.
+Streamlit app for downloading Webfleet trip reports and generating Webfleet, RDA, LTR, merge, and audit reports.
 
-## Run
+## Run locally
 
 ```powershell
 pip install -r requirements.txt
 streamlit run app.py
 ```
 
-The app writes resumable checkpoint files into the selected local output folder. Rerunning the same date range skips completed chunks and combines the available checkpoints into a local CSV for the dashboard.
+## Deploy on Streamlit Community Cloud
 
-Browser downloads only happen when you click the export buttons after the trips have been downloaded. Excel files are created only after clicking **Create Excel file**.
+1. Push this repository to GitHub.
+2. In Streamlit Community Cloud, create a new app from the repository.
+3. Select `app.py` as the entry point.
+4. Deploy from the branch you want to share.
+5. For a private app, deploy from a private GitHub repository and invite coworkers by email from the Streamlit Cloud sharing settings.
 
-After a CSV exists, open the Dashboard tab to filter and inspect trip data. The dashboard focuses on:
+Generated files are temporary server artifacts for the current app session. Users must download generated CSV, XLSX, and ZIP files from the app; reports are not saved to the user's desktop automatically.
+
+After a Webfleet CSV exists in the session, open the Dashboard tab to filter and inspect trip data. The dashboard focuses on:
 
 - `tripmode`
 - `start_time`
@@ -27,6 +33,7 @@ After a CSV exists, open the Dashboard tab to filter and inspect trip data. The 
 ## Notes
 
 - The Webfleet `showTripReportExtern` endpoint is rate limited. The default app setting waits 61 seconds between requests.
-- Credentials are entered in the Streamlit sidebar and are not written to disk by the app.
+- Webfleet credentials are entered in the app and are not persisted by the app.
+- Generated Nexus batch files prompt for Nexus credentials when run. Nexus credentials are not hardcoded in the app.
 - Excel output is skipped when the CSV has more rows than one Excel sheet can hold.
-- No Google Drive or cloud output is used.
+- No Docker setup is required for hosting.
