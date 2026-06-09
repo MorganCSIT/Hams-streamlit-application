@@ -65,7 +65,7 @@ def render_home_task() -> None:
 
     st.markdown(
         """
-        ### Avant de commencer
+        ### Comment commencer une tache
         - Choisissez une section dans le menu de droite.
         - Ajoutez les fichiers demandés, puis lancez le traitement.
         - Les boutons de téléchargement principaux apparaissent à côté du bouton de lancement.
@@ -73,19 +73,17 @@ def render_home_task() -> None:
         """
     )
 
-    st.markdown(
-        "[Télécharger le dossier nx-spi-client depuis le serveur](https://cloud.nexus-schweiz.ch/index.php/s/xokmebwanSH7DWH)"
-    )
-    st.caption(
-        "Le dossier nx-spi-client doit être téléchargé directement depuis ce lien du serveur pour que les transferts RDA fonctionnent. "
-        "Demandez le mot de passe à un administrateur."
-    )
+    
 
     st.subheader("Utiliser les batchs Nexus pour les transferts RDA")
     st.markdown(
         """
         Pour exécuter les batchs, téléchargez d'abord le dossier complet généré par la section **Transferts RDA**.
         Décompressez le fichier `.zip`, puis placez le dossier `nx-spi-client` dans le dossier RDA extrait, au même niveau que les dossiers `01_...`, `02_...`, `03_...` et les fichiers `HAS_map...csv`.
+        
+        [Télécharger le dossier nx-spi-client depuis le serveur](https://cloud.nexus-schweiz.ch/index.php/s/xokmebwanSH7DWH).
+        
+        Le dossier nx-spi-client ne peut pas être partagé entre plusieurs machines. Il doit être téléchargé directement depuis ce lien du serveur afin que les transferts RDA fonctionnent correctement. Veuillez demander le mot de passe à un administrateur.
 
         Exemple attendu :
         ```text
@@ -102,6 +100,7 @@ def render_home_task() -> None:
         Si le dossier `nx-spi-client` n'est pas téléchargé depuis le lien du serveur puis placé à cet endroit, les fichiers `.bat` ne trouveront pas `Asebis.Client.StarterCommand.exe` et le transfert Nexus échouera.
         """
     )
+    
 
     st.subheader("Fichiers et dossiers RDA")
     rda_files = [
