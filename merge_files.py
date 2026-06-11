@@ -137,6 +137,10 @@ def render_merge_dashboard(df: pd.DataFrame, key_prefix: str) -> None:
 def render_merge_task() -> None:
     st.title("Fusion de fichiers")
     st.caption("Fusionne les fichiers CSV/XLSX/XLS avec les mêmes noms d'en-têtes. L'ordre des colonnes suit le premier fichier.")
+    st.info(
+        "Conseil: les fichiers à fusionner doivent avoir les mêmes en-têtes de colonnes. "
+        "L'ordre peut être différent, mais les noms doivent correspondre exactement."
+    )
 
     default_output = get_session_output_root(MERGE_OUTPUT_FOLDER)
 

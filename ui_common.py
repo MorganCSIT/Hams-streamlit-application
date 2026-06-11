@@ -1,4 +1,35 @@
 from app_config import *
+
+
+TEMPLATE_FOLDER = APP_ROOT / "Templates"
+
+
+def template_display_name(path: Path) -> str:
+    name = re.sub(r"[_-]+", " ", path.stem).strip()
+    return name.title() if name else path.stem
+
+
+def render_template_downloads(folder: Path = TEMPLATE_FOLDER) -> None:
+    st.subheader("Modèles de fichiers")
+    st.caption("Téléchargez le dossier d'exemples pour comparer les en-têtes et les formats attendus.")
+
+    if not folder.exists():
+        st.info("Aucun modèle disponible pour le moment. Ajoutez un fichier ZIP dans le dossier Templates.")
+        return
+
+    template_paths = sorted(folder.glob("*.zip"), key=lambda path: path.name.lower())
+    if not template_paths:
+        st.info("Aucun modèle disponible pour le moment. Ajoutez un fichier ZIP dans le dossier Templates.")
+        return
+
+    for path in template_paths:
+        render_download_for_path(
+            path,
+            f"Télécharger {template_display_name(path)}",
+            key=f"template_zip_{path.name}",
+        )
+
+
 def read_csv_flex(source) -> pd.DataFrame:
     try:
         return pd.read_csv(source, sep=None, engine="python")

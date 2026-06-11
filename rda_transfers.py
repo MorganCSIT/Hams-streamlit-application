@@ -36,6 +36,7 @@ class RdaRunResult:
     overlaps: pd.DataFrame
     audit_summary: pd.DataFrame
     generated_files: list[Path]
+    minutes_added_by_client: pd.DataFrame | None = None
 
 
 def _pick_col(df: pd.DataFrame, candidates: list[str]) -> str | None:
@@ -851,6 +852,20 @@ def _adjustment_run(
     total_61010_before = int(pd.to_numeric(raw_61010[cols.duration], errors="coerce").fillna(0).sum())
     total_61010_after = int(pd.to_numeric(adjusted_61010[cols.duration], errors="coerce").fillna(0).sum())
     collabs_with_61010 = int(raw_61010[cols.collab].nunique(dropna=True))
+    minutes_added_by_client = pd.DataFrame()
+    if "Temps ajouté" in adjusted_df.columns:
+        added_rows = adjusted_df[pd.to_numeric(adjusted_df["Temps ajouté"], errors="coerce").fillna(0) > 0].copy()
+        if not added_rows.empty:
+            minutes_added_by_client = (
+                added_rows.assign(
+                    Client=added_rows[cols.client].apply(_norm_code),
+                    **{"Minutes ajoutées": pd.to_numeric(added_rows["Temps ajouté"], errors="coerce").fillna(0).astype(int)},
+                )
+                .groupby("Client", dropna=False, as_index=False)["Minutes ajoutées"]
+                .sum()
+                .sort_values("Minutes ajoutées", ascending=False)
+                .reset_index(drop=True)
+            )
     audit_summary = pd.DataFrame(
         [
             ["Total 61010 minutes before", total_61010_before],
@@ -874,7 +889,17 @@ def _adjustment_run(
     if not transfer_qa.empty:
         audit_summary = pd.concat([audit_summary, transfer_qa], ignore_index=True)
     zip_path = _write_zip(output_dir)
-    return RdaRunResult(output_dir, zip_path, adjusted_df, folder_summary, csv_summary, overlaps, audit_summary, _collect_files(output_dir, zip_path))
+    return RdaRunResult(
+        output_dir,
+        zip_path,
+        adjusted_df,
+        folder_summary,
+        csv_summary,
+        overlaps,
+        audit_summary,
+        _collect_files(output_dir, zip_path),
+        minutes_added_by_client,
+    )
 
 
 def _result_downloads(result: RdaRunResult, key_prefix: str) -> None:
@@ -927,6 +952,10 @@ def _render_result(result: RdaRunResult, key_prefix: str) -> None:
         metric_cols[0].metric("Total 61010 minutes before", total_61010_before)
         metric_cols[1].metric("Total 61010 minutes after", total_61010_after)
         metric_cols[2].metric("Number of collabs with at least one 61010", collabs_with_61010)
+    minutes_added_by_client = getattr(result, "minutes_added_by_client", None)
+    if minutes_added_by_client is not None and not minutes_added_by_client.empty:
+        st.subheader("Minutes ajoutées par client")
+        st.dataframe(minutes_added_by_client, use_container_width=True, hide_index=True)
     tabs = st.tabs(["Résumé"])
     with tabs[0]:
         st.subheader("QA")
@@ -955,15 +984,10 @@ def _uo_options() -> tuple[list[str], int]:
 
 def _adjustment_inputs(key_prefix: str):
     rda_file = st.file_uploader("Fichier RDA à ajuster", type=RDA_ALLOWED_EXTENSIONS, key=f"{key_prefix}_rda")
-    config_cols = st.columns(3)
+    config_cols = st.columns(2)
     source_label = config_cols[0].selectbox("UO du fichier RDA", list(RDA_OE_MAP.keys()), key=f"{key_prefix}_source")
     output_name = config_cols[1].text_input("Nom du dossier", value=f"RDA {datetime.now().strftime('%m%Y')}", key=f"{key_prefix}_output")
-    nx_path = config_cols[2].text_input(
-        "nx-spi-client exe",
-        value="",
-        placeholder=r"..\nx-spi-client\Asebis.Client.StarterCommand.exe",
-        key=f"{key_prefix}_nx",
-    )
+    nx_path = ""
     ready = rda_file is not None
     if not ready:
         st.info("Ajoutez le fichier RDA pour lancer l'ajustement.")
@@ -975,16 +999,11 @@ def _transfer_inputs(key_prefix: str):
     rda_file = upload_cols[0].file_uploader("Fichier RDA à transférer", type=RDA_ALLOWED_EXTENSIONS, key=f"{key_prefix}_rda")
     mapping_file = upload_cols[1].file_uploader("Fichier Mapping", type=["xlsx", "xls"], key=f"{key_prefix}_mapping")
     target_options, default_target_idx = _uo_options()
-    config_cols = st.columns(4)
+    config_cols = st.columns(3)
     source_label = config_cols[0].selectbox("UO source", list(RDA_OE_MAP.keys()), key=f"{key_prefix}_source")
     target_label = config_cols[1].selectbox("UO cible", target_options, index=default_target_idx, key=f"{key_prefix}_target")
     output_name = config_cols[2].text_input("Nom du dossier", value=f"RDA {datetime.now().strftime('%m%Y')}", key=f"{key_prefix}_output")
-    nx_path = config_cols[3].text_input(
-        "nx-spi-client exe",
-        value="",
-        placeholder=r"..\nx-spi-client\Asebis.Client.StarterCommand.exe",
-        key=f"{key_prefix}_nx",
-    )
+    nx_path = ""
     excluded_codes_raw = st.text_input(
         "Prestations à exclure du transfert",
         value="",

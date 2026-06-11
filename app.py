@@ -29,40 +29,6 @@ render_webfleet_task = _webfleet.render_webfleet_task
 def render_home_task() -> None:
     st.title("Accueil")
     st.caption("Outils internes pour télécharger, fusionner, préparer et auditer les données Webfleet, RDA et LTR.")
-
-    st.subheader("Obtenir et activer l'accès API Webfleet")
-    st.markdown(
-        """
-        Pour utiliser la section **Téléchargement Webfleet**, l'utilisateur doit avoir un compte Webfleet et une clé API. Cette clé API n'est pas créée dans l'application : elle doit être demandée à Webfleet Support par email.
-
-        Envoyez la demande à `support.de@webfleet.com`. Le message peut reprendre le modèle ci-dessous. Chaque ligne explique directement quelle information mettre :
-
-        ```text
-        Bonjour,
-
-        Je souhaite demander une clé API Webfleet. Voici les informations nécessaires :
-
-        Nom de l'application : indiquez le nom de l'outil ou de l'application qui utilisera l'API.
-        Nom de l'intégrateur : indiquez le nom de votre entreprise ou de l'organisation responsable de l'intégration.
-        Site web : indiquez le site web officiel de l'entreprise.
-        Personne de contact : indiquez le nom de la personne que Webfleet peut contacter pour cette demande.
-        Adresse : indiquez l'adresse postale de l'entreprise.
-        Numéro de téléphone : indiquez le numéro de téléphone de la personne de contact.
-        Email : indiquez l'adresse email de la personne de contact.
-
-        Description de l'application :
-        Nous souhaitons automatiser des rapports internes et des contrôles de conformité pour nos opérations. L'application récupère les trajets et les données d'utilisation des véhicules depuis Webfleet avec l'API .connect, traite les données dans notre outil interne, puis permet de télécharger les résultats pour intégration dans nos processus existants. Il ne s'agit pas d'une intégration de Webfleet dans une plateforme tierce établie, mais d'une utilisation interne pour obtenir un flux de travail plus flexible et automatisé, adapté à nos besoins.
-
-        Merci de me dire si d'autres informations sont nécessaires pour traiter la demande.
-
-        Cordialement,
-        indiquez votre nom
-        ```
-
-        Après la réponse de Webfleet avec la clé API, le compte maître Webfleet doit se connecter à Webfleet, ouvrir les paramètres de l'utilisateur concerné, puis activer l'utilisation de l'API pour cet utilisateur. Sans cette activation côté utilisateur, le téléchargement Webfleet ne fonctionnera pas même si la clé API existe.
-        """
-    )
-
     st.markdown(
         """
         ### Comment commencer une tache
@@ -73,7 +39,7 @@ def render_home_task() -> None:
         """
     )
 
-    
+    _ui_common.render_template_downloads()
 
     st.subheader("Utiliser les batchs Nexus pour les transferts RDA")
     st.markdown(
@@ -100,7 +66,6 @@ def render_home_task() -> None:
         Si le dossier `nx-spi-client` n'est pas téléchargé depuis le lien du serveur puis placé à cet endroit, les fichiers `.bat` ne trouveront pas `Asebis.Client.StarterCommand.exe` et le transfert Nexus échouera.
         """
     )
-    
 
     st.subheader("Fichiers et dossiers RDA")
     rda_files = [
@@ -150,6 +115,39 @@ def render_home_task() -> None:
         },
     ]
     st.dataframe(rda_files, use_container_width=True, hide_index=True)
+
+    st.subheader("Obtenir et activer l'accès API Webfleet")
+    st.markdown(
+        """
+        Pour utiliser la section **Téléchargement Webfleet**, l'utilisateur doit avoir un compte Webfleet et une clé API. Cette clé API n'est pas créée dans l'application : elle doit être demandée à Webfleet Support par email.
+
+        Envoyez la demande à `support.de@webfleet.com`. Le message peut reprendre le modèle ci-dessous. Chaque ligne explique directement quelle information mettre :
+
+        ```text
+        Bonjour,
+
+        Je souhaite demander une clé API Webfleet. Voici les informations nécessaires :
+
+        Nom de l'application : indiquez le nom de l'outil ou de l'application qui utilisera l'API.
+        Nom de l'intégrateur : indiquez le nom de votre entreprise ou de l'organisation responsable de l'intégration.
+        Site web : indiquez le site web officiel de l'entreprise.
+        Personne de contact : indiquez le nom de la personne que Webfleet peut contacter pour cette demande.
+        Adresse : indiquez l'adresse postale de l'entreprise.
+        Numéro de téléphone : indiquez le numéro de téléphone de la personne de contact.
+        Email : indiquez l'adresse email de la personne de contact.
+
+        Description de l'application :
+        Nous souhaitons automatiser des rapports internes et des contrôles de conformité pour nos opérations. L'application récupère les trajets et les données d'utilisation des véhicules depuis Webfleet avec l'API .connect, traite les données dans notre outil interne, puis permet de télécharger les résultats pour intégration dans nos processus existants. Il ne s'agit pas d'une intégration de Webfleet dans une plateforme tierce établie, mais d'une utilisation interne pour obtenir un flux de travail plus flexible et automatisé, adapté à nos besoins.
+
+        Merci de me dire si d'autres informations sont nécessaires pour traiter la demande.
+
+        Cordialement,
+        indiquez votre nom
+        ```
+
+        Après la réponse de Webfleet avec la clé API, le compte maître Webfleet doit se connecter à Webfleet, ouvrir les paramètres de l'utilisateur concerné, puis activer l'utilisation de l'API pour cet utilisateur. Sans cette activation côté utilisateur, le téléchargement Webfleet ne fonctionnera pas même si la clé API existe.
+        """
+    )
 
     st.divider()
 

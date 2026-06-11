@@ -6,3 +6,4 @@ numpy
 pytz
 xlrd
 matplotlib
+altair

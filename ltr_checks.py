@@ -181,7 +181,11 @@ def ltr_process(matched_upload, rda_upload, output_name: str) -> dict:
     unmatched_df = df[unmatched_mask | ambig_mask].copy()
     if unmatched_df.empty:
         unrecognized_summary = pd.DataFrame(columns=["Collaborateur", "No collaborateur", "collab_match_status", "collab_key", "Row Count"])
+        unrecognized_rows = pd.DataFrame()
     else:
+        unrecognized_rows = unmatched_df.copy()
+        if "start_dt_local" in unrecognized_rows.columns:
+            unrecognized_rows["TARGET_MONTH"] = pd.to_datetime(unrecognized_rows["start_dt_local"], errors="coerce").dt.strftime("%Y-%m")
         unrecognized_summary = (
             unmatched_df.groupby(["Collaborateur", "No collaborateur", "collab_match_status", "collab_key"], dropna=False)
             .size()
@@ -218,6 +222,7 @@ def ltr_process(matched_upload, rda_upload, output_name: str) -> dict:
         "calendar_slices": calendar_slices_df,
         "breaks_audit": breaks_audit,
         "unrecognized_summary": unrecognized_summary,
+        "unrecognized_rows": unrecognized_rows,
         "metrics": {
             "raw_rows": len(df),
             "services": len(services_df),
@@ -246,43 +251,115 @@ def ltr_filtered_df(df: pd.DataFrame, filters: dict) -> pd.DataFrame:
     return out
 
 
+def ltr_filtered_support_df(df: pd.DataFrame, filters: dict, month_cols: list[str]) -> pd.DataFrame:
+    out = df.copy()
+    if out.empty:
+        return out
+    if filters.get("months"):
+        for col in month_cols:
+            if col in out.columns:
+                out = out[out[col].astype(str).isin(filters["months"])]
+                break
+    if filters.get("collaborators") and "Collaborateur" in out.columns:
+        out = out[out["Collaborateur"].astype(str).isin(filters["collaborators"])]
+    return out
+
+
+def ltr_summary_from_filtered_infractions(filtered: pd.DataFrame) -> pd.DataFrame:
+    if filtered.empty or "TARGET_MONTH" not in filtered.columns:
+        return pd.DataFrame(columns=["TARGET_MONTH", "TOTAL_INFRACTIONS"])
+
+    summary = filtered.groupby("TARGET_MONTH", dropna=False).size().reset_index(name="TOTAL_INFRACTIONS")
+    for rule in sorted(filtered["RULE"].dropna().astype(str).unique().tolist()) if "RULE" in filtered.columns else []:
+        counts = (
+            filtered[filtered["RULE"].astype(str).eq(rule)]
+            .groupby("TARGET_MONTH", dropna=False)
+            .size()
+            .rename(rule)
+        )
+        summary = summary.merge(counts, left_on="TARGET_MONTH", right_index=True, how="left")
+    return summary.fillna(0)
+
+
+def ltr_unrecognized_summary(unrecognized_rows: pd.DataFrame) -> pd.DataFrame:
+    columns = ["Collaborateur", "No collaborateur", "collab_match_status", "collab_key", "Row Count"]
+    if unrecognized_rows.empty:
+        return pd.DataFrame(columns=columns)
+    return (
+        unrecognized_rows.groupby(["Collaborateur", "No collaborateur", "collab_match_status", "collab_key"], dropna=False)
+        .size()
+        .reset_index(name="Row Count")
+        .sort_values("Row Count", ascending=False)
+        .reset_index(drop=True)
+    )
+
+
 def render_ltr_chart(title: str, df: pd.DataFrame, x_col: str, y_col: str) -> None:
     st.subheader(title)
     if df.empty or x_col not in df.columns or y_col not in df.columns:
         st.info("Aucune donnée de graphique.")
         return
     chart_df = df[[x_col, y_col]].copy()
-    chart_df[x_col] = chart_df[x_col].astype(str)
-    st.bar_chart(chart_df.set_index(x_col))
+    chart_df = chart_df.rename(columns={x_col: "Catégorie", y_col: "Nombre"})
+    chart_df["Catégorie"] = chart_df["Catégorie"].astype(str)
+
+    try:
+        import altair as alt
+
+        chart = (
+            alt.Chart(chart_df)
+            .mark_bar()
+            .encode(
+                x=alt.X("Catégorie:N", title=None, sort=None),
+                y=alt.Y("Nombre:Q", title=None),
+                tooltip=[
+                    alt.Tooltip("Catégorie:N", title="Catégorie"),
+                    alt.Tooltip("Nombre:Q", title="Nombre"),
+                ],
+            )
+            .properties(title=None)
+        )
+        st.altair_chart(chart, use_container_width=True)
+    except Exception:
+        st.bar_chart(chart_df.set_index("Catégorie"))
 
 
 def render_ltr_dashboard(result: dict) -> None:
-    metrics = result["metrics"]
-    metric_cols = st.columns(6)
-    metric_cols[0].metric("Infractions", f"{metrics['infractions']:,}")
-    metric_cols[1].metric("Collaborateurs concernés", f"{metrics['affected_collaborators']:,}")
-    metric_cols[2].metric("Services", f"{metrics['services']:,}")
-    metric_cols[3].metric("Créneaux calendrier", f"{metrics['calendar_slices']:,}")
-    metric_cols[4].metric("Qualité des données", f"{metrics['data_quality_rows']:,}")
-    metric_cols[5].metric("Lignes non reconnues", f"{metrics['unrecognized_rows']:,}")
-
     all_infractions = result["all_infractions"]
-    filter_cols = st.columns(4)
+    filter_cols = st.columns(3)
     months = sorted(all_infractions["TARGET_MONTH"].dropna().astype(str).unique().tolist()) if "TARGET_MONTH" in all_infractions.columns and not all_infractions.empty else []
     rules = sorted(all_infractions["RULE"].dropna().astype(str).unique().tolist()) if "RULE" in all_infractions.columns and not all_infractions.empty else []
-    severities = sorted(all_infractions["SEVERITY"].dropna().astype(str).unique().tolist()) if "SEVERITY" in all_infractions.columns and not all_infractions.empty else []
     collaborators = sorted(all_infractions["Collaborateur"].dropna().astype(str).unique().tolist()) if "Collaborateur" in all_infractions.columns and not all_infractions.empty else []
     filters = {
         "months": filter_cols[0].multiselect("Mois", months),
         "rules": filter_cols[1].multiselect("Règle", rules),
-        "severities": filter_cols[2].multiselect("Sévérité", severities),
-        "collaborators": filter_cols[3].multiselect("Collaborateur", collaborators),
+        "collaborators": filter_cols[2].multiselect("Collaborateur", collaborators),
     }
     filtered = ltr_filtered_df(all_infractions, filters)
+    filtered_services = ltr_filtered_support_df(result["services_audit"], filters, ["service_month", "TARGET_MONTH"])
+    filtered_calendar = ltr_filtered_support_df(result["calendar_slices"], filters, ["target_month", "TARGET_MONTH"])
+    filtered_rest_review = ltr_filtered_support_df(result["rest_review"], filters, ["TARGET_MONTH"])
+    unrecognized_rows = result.get("unrecognized_rows", pd.DataFrame())
+    if unrecognized_rows.empty and not result["unrecognized_summary"].empty:
+        filtered_unrecognized_summary = ltr_filtered_support_df(result["unrecognized_summary"], filters, [])
+        filtered_unrecognized_count = int(filtered_unrecognized_summary["Row Count"].sum()) if "Row Count" in filtered_unrecognized_summary.columns else 0
+    else:
+        filtered_unrecognized_rows = ltr_filtered_support_df(unrecognized_rows, filters, ["TARGET_MONTH"])
+        filtered_unrecognized_summary = ltr_unrecognized_summary(filtered_unrecognized_rows)
+        filtered_unrecognized_count = len(filtered_unrecognized_rows)
+    filtered_summary = ltr_summary_from_filtered_infractions(filtered)
+
+    metric_cols = st.columns(5)
+    metric_cols[0].metric("Infractions", f"{len(filtered):,}")
+    affected = filtered["collab_uid"].nunique() if "collab_uid" in filtered.columns and not filtered.empty else 0
+    metric_cols[1].metric("Collaborateurs concernés", f"{affected:,}")
+    metric_cols[2].metric("Services", f"{len(filtered_services):,}")
+    metric_cols[3].metric("Créneaux calendrier", f"{len(filtered_calendar):,}")
+    metric_cols[4].metric("Lignes non reconnues", f"{filtered_unrecognized_count:,}")
 
     chart_cols = st.columns(2)
     with chart_cols[0]:
-        render_ltr_chart("Infractions par mois", result["summary_by_month"], "TARGET_MONTH", "TOTAL_INFRACTIONS")
+        render_ltr_chart("Infractions par mois", filtered_summary, "TARGET_MONTH", "TOTAL_INFRACTIONS")
     with chart_cols[1]:
         if filtered.empty or "RULE" not in filtered.columns:
             st.subheader("Infractions par règle")
@@ -291,22 +368,12 @@ def render_ltr_dashboard(result: dict) -> None:
             by_rule = filtered.groupby("RULE").size().reset_index(name="Count")
             render_ltr_chart("Infractions par règle", by_rule, "RULE", "Count")
 
-    chart_cols_2 = st.columns(2)
-    with chart_cols_2[0]:
-        if filtered.empty or "Collaborateur" not in filtered.columns:
-            st.subheader("Principaux collaborateurs")
-            st.info("Aucune donnée de graphique.")
-        else:
-            top_collabs = filtered.groupby("Collaborateur").size().sort_values(ascending=False).head(15).reset_index(name="Count")
-            render_ltr_chart("Principaux collaborateurs", top_collabs, "Collaborateur", "Count")
-    with chart_cols_2[1]:
-        dq = result["data_quality"]
-        if dq.empty or "QUALITY_TYPE" not in dq.columns:
-            st.subheader("Types de qualité des données")
-            st.info("Aucune donnée de graphique.")
-        else:
-            dq_counts = dq.groupby("QUALITY_TYPE").size().reset_index(name="Count")
-            render_ltr_chart("Types de qualité des données", dq_counts, "QUALITY_TYPE", "Count")
+    if filtered.empty or "Collaborateur" not in filtered.columns:
+        st.subheader("Principaux collaborateurs")
+        st.info("Aucune donnée de graphique.")
+    else:
+        top_collabs = filtered.groupby("Collaborateur").size().sort_values(ascending=False).head(15).reset_index(name="Count")
+        render_ltr_chart("Principaux collaborateurs", top_collabs, "Collaborateur", "Count")
 
     st.subheader("Infractions filtrées")
     st.dataframe(filtered, width="stretch", hide_index=True)
@@ -318,32 +385,30 @@ def render_ltr_dashboard(result: dict) -> None:
             mime="text/csv",
         )
 
-    tab_names = ["Résumé", "Revue des repos", "Qualité des données", "Services", "Audit des pauses", "Créneaux calendrier", "Non reconnus"]
+    tab_names = ["Résumé", "Revue des repos", "Services", "Audit des pauses", "Créneaux calendrier", "Non reconnus"]
     tabs = st.tabs(tab_names)
     with tabs[0]:
-        st.dataframe(result["summary_by_month"], width="stretch", hide_index=True)
+        st.dataframe(filtered_summary, width="stretch", hide_index=True)
     with tabs[1]:
-        st.dataframe(result["rest_review"], width="stretch", hide_index=True)
+        st.dataframe(filtered_rest_review, width="stretch", hide_index=True)
     with tabs[2]:
-        data_quality = result["data_quality"]
-        dq_types = sorted(data_quality["QUALITY_TYPE"].dropna().astype(str).unique().tolist()) if "QUALITY_TYPE" in data_quality.columns and not data_quality.empty else []
-        selected_dq = st.multiselect("Type de qualité des données", dq_types)
-        if selected_dq:
-            data_quality = data_quality[data_quality["QUALITY_TYPE"].astype(str).isin(selected_dq)]
-        st.dataframe(data_quality, width="stretch", hide_index=True)
+        st.dataframe(filtered_services, width="stretch", hide_index=True)
     with tabs[3]:
-        st.dataframe(result["services_audit"], width="stretch", hide_index=True)
+        st.dataframe(ltr_filtered_support_df(result["breaks_audit"], filters, ["TARGET_MONTH"]), width="stretch", hide_index=True)
     with tabs[4]:
-        st.dataframe(result["breaks_audit"], width="stretch", hide_index=True)
+        st.dataframe(filtered_calendar, width="stretch", hide_index=True)
     with tabs[5]:
-        st.dataframe(result["calendar_slices"], width="stretch", hide_index=True)
-    with tabs[6]:
-        st.dataframe(result["unrecognized_summary"], width="stretch", hide_index=True)
+        st.dataframe(filtered_unrecognized_summary, width="stretch", hide_index=True)
 
 
 def render_ltr_task() -> None:
     st.title("Contrôles LTR")
     st.caption("Exécute les contrôles LTR hybrides et crée le classeur Excel multi-feuilles avec un tableau de bord d'audit.")
+    st.info(
+        "Conseil: pour contrôler un mois, incluez le RDA depuis 14 jours avant le début du mois jusqu'à 7 jours "
+        "après la fin du mois. Exemple pour mars: du 15 février au 7 avril. Cela permet aux contrôles de repos, "
+        "séries de jours, services qui passent minuit et semaines de 50h de voir le contexte autour du mois."
+    )
 
     cols = st.columns(3)
     matched_file = cols[0].file_uploader("Classeur collaborateurs matchés", type=["xlsx", "xls"], key="ltr_matched")
