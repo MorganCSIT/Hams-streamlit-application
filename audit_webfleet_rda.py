@@ -27,6 +27,20 @@ def audit_extract_code_any(x):
     return m.group(1) if m else np.nan
 
 
+def audit_clean_legend_text(x):
+    if pd.isna(x):
+        return ""
+    s = re.sub(r"\s+", " ", str(x).strip())
+    return "" if s.lower() in {"nan", "nat", "none", "<na>"} else s
+
+
+def audit_shorten_text(text, max_len):
+    text = audit_clean_legend_text(text)
+    if len(text) <= max_len:
+        return text
+    return text[:max(0, max_len - 1)].rstrip() + "…"
+
+
 def audit_swiss_date(series_like):
     return pd.to_datetime(series_like, errors="coerce", dayfirst=True).dt.date
 
@@ -564,6 +578,9 @@ def audit_process(rda_file, wf_file, mapping_file, planning_file, progress_cb=No
         "duree": rda_pick_col(RDA, ["Durée", "Duree", "duration", "Minutes"]),
         "collab_name": rda_pick_col(RDA, ["Collaborateur", "collaborateur", "Employee"]),
         "collab_no": rda_pick_col(RDA, ["No collaborateur", "No Collaborateur", "Employee No", "no_collaborateur"]),
+        "client_nr": rda_pick_col(RDA, ["N° du client", "No client", "ID client", "Client No", "client_nr", "KD-Nr", "KD_Nr"]),
+        "client_name": rda_pick_col(RDA, ["Client"]),
+        "prestation_name": rda_pick_col(RDA, ["Prestation", "prestation"]),
     }
     missing = [k for k, v in rda_cols.items() if v is None and k in ["jour", "debut", "fin", "duree", "collab_no"]]
     if missing:
@@ -576,6 +593,12 @@ def audit_process(rda_file, wf_file, mapping_file, planning_file, progress_cb=No
         "duree_min": pd.to_numeric(RDA[rda_cols["duree"]], errors="coerce"),
         "collab_name": (RDA[rda_cols["collab_name"]].astype(str) if rda_cols["collab_name"] else ""),
         "collab_no_sarl": RDA[rda_cols["collab_no"]].apply(audit_to_int_str),
+        "client_nr": (RDA[rda_cols["client_nr"]].apply(audit_to_int_str) if rda_cols["client_nr"] else None),
+        "client_name": (RDA[rda_cols["client_name"]].apply(audit_clean_legend_text) if rda_cols["client_name"] else ""),
+        "prestation_text": (
+            RDA[rda_cols["prestation_name"]].apply(audit_clean_legend_text)
+            if rda_cols["prestation_name"] else ""
+        ),
     })
     mask = rda["duree_min"].isna() & rda["start"].notna() & rda["end"].notna()
     rda.loc[mask, "duree_min"] = (rda.loc[mask, "end"] - rda.loc[mask, "start"]).dt.total_seconds() / 60.0
@@ -592,6 +615,8 @@ def audit_process(rda_file, wf_file, mapping_file, planning_file, progress_cb=No
     rda["prestation_code"] = np.nan
     if best_col is not None:
         rda["prestation_code"] = RDA[best_col].apply(audit_extract_code_any)
+        if not rda_cols["prestation_name"]:
+            rda["prestation_text"] = RDA[best_col].apply(audit_clean_legend_text)
     rda["rda_row_id"] = np.arange(len(rda), dtype=int)
 
     _prog(0.20, "Normalisation Webfleet...")
@@ -684,6 +709,8 @@ def audit_process(rda_file, wf_file, mapping_file, planning_file, progress_cb=No
         "type": rda_pick_col(PLANNING, ["type"]),
         "note": rda_pick_col(PLANNING, ["note"]),
         "client_nr": rda_pick_col(PLANNING, ["client_nr"]),
+        "client_firstname": rda_pick_col(PLANNING, ["client_firstname"]),
+        "client_lastname": rda_pick_col(PLANNING, ["client_lastname"]),
     }
     missing_plan = [k for k, v in plan_cols.items() if v is None and k in ["emp_nr", "date", "start", "end", "event_color"]]
     if missing_plan:
@@ -752,6 +779,23 @@ def audit_process(rda_file, wf_file, mapping_file, planning_file, progress_cb=No
         "note": (PLANNING[plan_cols["note"]].fillna("").astype(str) if plan_cols["note"] else ""),
         "client_nr": (PLANNING[plan_cols["client_nr"]].apply(audit_to_int_str) if plan_cols["client_nr"] else None),
     })
+    planning_firstname = (
+        PLANNING[plan_cols["client_firstname"]].apply(audit_clean_legend_text)
+        if plan_cols["client_firstname"] else pd.Series("", index=PLANNING.index)
+    )
+    planning_lastname = (
+        PLANNING[plan_cols["client_lastname"]].apply(audit_clean_legend_text)
+        if plan_cols["client_lastname"] else pd.Series("", index=PLANNING.index)
+    )
+    planning["client_name"] = (planning_lastname + " " + planning_firstname).str.strip()
+    planning["client_label"] = planning["client_name"].fillna("").astype(str).str.strip()
+    if "client_nr" in planning.columns:
+        nr_label = planning["client_nr"].fillna("").astype(str).str.strip()
+        planning["client_label"] = np.where(
+            planning["client_label"].astype(str).str.len() > 0,
+            planning["client_label"],
+            np.where(nr_label.str.len() > 0, "Client " + nr_label, ""),
+        )
 
     overnight = planning["start"].notna() & planning["end"].notna() & (planning["end"] < planning["start"])
     planning.loc[overnight, "end"] = planning.loc[overnight, "end"] + pd.Timedelta(days=1)
@@ -1272,6 +1316,19 @@ def audit_build_chart_data(result: dict):
                 return pd.Timestamp(fb).strftime("%Y-%m-%d")
         return None
 
+    def _cmp_planning_color(row_dict):
+        if str(row_dict.get("client_absent", "")).strip().upper() == "Y":
+            return "#000000"
+        key = str(row_dict.get("event_color_key", "")).strip().lower()
+        return AUDIT_PLAN_COLOR_MAP.get(key, row_dict.get("plot_color", "#bdbdbd"))
+
+    def _prestation_desc(code, text):
+        code = str(code).strip() if pd.notna(code) else ""
+        text = audit_clean_legend_text(text)
+        if code:
+            text = re.sub(rf"^\s*{re.escape(code)}\s*[-:–—]?\s*", "", text).strip()
+        return text
+
     def _cmp_rda_orig_color(code):
         code = str(code).strip() if pd.notna(code) else ""
         if code in ["16009", "95900"]:
@@ -1279,12 +1336,6 @@ def audit_build_chart_data(result: dict):
         if code == str(AUDIT_PRESTATION_61010_CODE):
             return "#800080"
         return "#2ca02c"
-
-    def _cmp_planning_color(row_dict):
-        if str(row_dict.get("client_absent", "")).strip().upper() == "Y":
-            return "#000000"
-        key = str(row_dict.get("event_color_key", "")).strip().lower()
-        return AUDIT_PLAN_COLOR_MAP.get(key, row_dict.get("plot_color", "#bdbdbd"))
 
     LANE_Y = {"WF": 0.0, "RDA_ORIG": 1.0, "Planning": 2.0}
 
@@ -1351,14 +1402,21 @@ def audit_build_chart_data(result: dict):
         if not date_str:
             continue
         code = getattr(rr, "prestation_code", np.nan)
+        prestation_text = getattr(rr, "prestation_text", "")
+        code_key = str(code).strip() if pd.notna(code) else ""
+        client_nr = audit_clean_legend_text(getattr(rr, "client_nr", ""))
+        client_name = audit_clean_legend_text(getattr(rr, "client_name", ""))
         is_61010 = str(code) == str(AUDIT_PRESTATION_61010_CODE)
         rows_ev.append({
             "collab_id": cid, "collab_label": collab_labels.get(cid, cid), "date_str": date_str,
             "kind": "RDA_ORIG", "y": LANE_Y["RDA_ORIG"], "left": s, "right": e, "mid": s + (e - s) / 2, "height": 0.34,
-            "fill_color": _cmp_rda_orig_color(code), "line_color": "#202020",
+            "fill_color": _cmp_rda_orig_color(code_key), "line_color": "#202020",
             "label_text": f"{int(round(audit_duration_mins(s, e)))}m", "label_y": 0.80,
             "label_color": "#b30000" if is_61010 else "#111111",
             "km_label": "", "km_label_y": np.nan, "km_label_color": "#111111", "wf_index": np.nan,
+            "client_nr": client_nr, "client_label": client_name or (f"Client {client_nr}" if client_nr else ""),
+            "event_color": "", "event_color_key": "",
+            "prestation_code": code_key, "prestation_text": _prestation_desc(code_key, prestation_text),
         })
 
     plan_local = planning.dropna(subset=["collab_id", "start", "end"]).copy()
@@ -1370,16 +1428,24 @@ def audit_build_chart_data(result: dict):
             continue
         cid = str(rr.collab_id)
         rr_dict = rr._asdict()
+        client_nr = audit_clean_legend_text(rr_dict.get("client_nr", ""))
+        client_label = audit_clean_legend_text(rr_dict.get("client_label", ""))
+        event_color = audit_clean_legend_text(rr_dict.get("event_color", ""))
+        event_color_key = audit_clean_legend_text(rr_dict.get("event_color_key", ""))
         plan_date_value = rr_dict.get("date_only", rr_dict.get("date", pd.NaT))
         date_str = _cmp_date_str(plan_date_value, fallback_ts=s)
         if not date_str:
             continue
+        planning_color = _cmp_planning_color(rr_dict)
         rows_ev.append({
             "collab_id": cid, "collab_label": collab_labels.get(cid, cid), "date_str": date_str,
             "kind": "Planning", "y": LANE_Y["Planning"], "left": s, "right": e, "mid": s + (e - s) / 2, "height": 0.34,
-            "fill_color": _cmp_planning_color(rr_dict), "line_color": "#4A3B33",
+            "fill_color": planning_color, "line_color": "#4A3B33",
             "label_text": f"{int(round(audit_duration_mins(s, e)))}m", "label_y": 1.80, "label_color": "#111111",
             "km_label": "", "km_label_y": np.nan, "km_label_color": "#111111", "wf_index": np.nan,
+            "client_nr": client_nr, "client_label": client_label,
+            "event_color": event_color, "event_color_key": event_color_key,
+            "prestation_code": "", "prestation_text": "",
         })
 
     if not rows_ev:
@@ -1434,6 +1500,7 @@ def audit_build_day_fig(data_ctx: dict, result: dict, cid: str, date_str: str):
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
         import matplotlib.dates as mdates
+        import matplotlib.patches as mpatches
     except ImportError:
         return None
 
@@ -1496,6 +1563,151 @@ def audit_build_day_fig(data_ctx: dict, result: dict, cid: str, date_str: str):
             lines.append(f"{idx_txt}. {s} → {e} ({mins_txt}){km_txt}")
         return "ALL WF TRIPS\n" + "\n".join(lines)
 
+    def _legend_items(day_events):
+        client_items = []
+        seen_clients = set()
+        for _, row in day_events[day_events["kind"].isin(["RDA_ORIG", "Planning"])].sort_values(["kind", "left", "right"]).iterrows():
+            client_nr = audit_clean_legend_text(row.get("client_nr", ""))
+            label = audit_clean_legend_text(row.get("client_label", ""))
+            if not client_nr:
+                continue
+            if not label:
+                label = f"Client {client_nr}"
+            if client_nr not in seen_clients:
+                seen_clients.add(client_nr)
+                client_items.append((client_nr, label))
+
+        planning_color_items = []
+        seen_plan_colors = set()
+        for _, row in day_events[day_events["kind"] == "Planning"].sort_values(["event_color", "left", "right"]).iterrows():
+            event_color = audit_clean_legend_text(row.get("event_color", ""))
+            color = audit_clean_legend_text(row.get("fill_color", "#bdbdbd")) or "#bdbdbd"
+            label = event_color or "event_color vide"
+            key = (label.lower(), color)
+            if key not in seen_plan_colors:
+                seen_plan_colors.add(key)
+                planning_color_items.append((label, color))
+
+        prestation_items = []
+        seen_prest = set()
+        for _, row in day_events[day_events["kind"] == "RDA_ORIG"].sort_values(["left", "right"]).iterrows():
+            code = audit_clean_legend_text(row.get("prestation_code", ""))
+            if not code or code in seen_prest:
+                continue
+            seen_prest.add(code)
+            prestation_items.append((
+                code,
+                audit_clean_legend_text(row.get("prestation_text", "")),
+                audit_clean_legend_text(row.get("fill_color", "#2ca02c")),
+            ))
+        return client_items, planning_color_items, prestation_items
+
+    def _wrap_client_label(label, max_len=18):
+        label = audit_clean_legend_text(label)
+        if len(label) <= max_len:
+            return label
+        parts = label.split()
+        if len(parts) <= 1:
+            return label
+        lines = []
+        cur = ""
+        for part in parts:
+            candidate = f"{cur} {part}".strip()
+            if cur and len(candidate) > max_len:
+                lines.append(cur)
+                cur = part
+            else:
+                cur = candidate
+        if cur:
+            lines.append(cur)
+        return "\n".join(lines[:2])
+
+    def _draw_client_index_box(fig, rect, client_items):
+        if not client_items:
+            return
+        rows = len(client_items)
+        fs = 7.2 if rows <= 8 else 6.4 if rows <= 12 else 5.6
+        ax_client = fig.add_axes(rect)
+        ax_client.set_axis_off()
+        ax_client.text(0.0, 1.0, "CLIENTS", transform=ax_client.transAxes,
+                       ha="left", va="top", fontsize=fs + 0.5, fontweight="bold", color="#222222")
+        top_y = 0.90
+        row_step = 0.82 / max(1, rows)
+        for idx, (client_nr, label) in enumerate(client_items):
+            row = idx
+            x = 0.0
+            y = top_y - row * row_step
+            max_name_len = 21
+            client_txt = audit_shorten_text(client_nr, 9)
+            if len(client_txt) > 4:
+                client_prefix, client_suffix = client_txt[:-4], client_txt[-4:]
+            else:
+                client_prefix, client_suffix = "", client_txt
+            prefix_pts = len(client_prefix) * fs * 0.55
+            suffix_pts = len(client_suffix) * (fs + 2.0) * 0.58
+            if client_prefix:
+                ax_client.annotate(
+                    client_prefix, xy=(x, y), xycoords=ax_client.transAxes,
+                    xytext=(0, 0), textcoords="offset points",
+                    ha="left", va="top", fontsize=max(5.2, fs - 1.3),
+                    family="monospace", color="#222222", fontweight="normal",
+                )
+            ax_client.annotate(
+                client_suffix, xy=(x, y), xycoords=ax_client.transAxes,
+                xytext=(prefix_pts, 0), textcoords="offset points",
+                ha="left", va="top", fontsize=fs + 2.0,
+                family="monospace", color="#111111", fontweight="bold",
+            )
+            ax_client.annotate(
+                f" = {audit_shorten_text(label, max_name_len)}", xy=(x, y), xycoords=ax_client.transAxes,
+                xytext=(prefix_pts + suffix_pts + 4, 0), textcoords="offset points",
+                ha="left", va="top", fontsize=fs,
+                family="monospace", color="#222222", fontweight="bold",
+            )
+
+    def _draw_header_indexes(fig, plan_items, prest_items):
+        _draw_lane_box(fig, [0.300, 0.785, 0.195, 0.095], "PLANNING COLORS", plan_items, fs=8.2)
+        _draw_lane_box(fig, [0.505, 0.785, 0.210, 0.095], "PRESTATION INDEX", prest_items, fs=8.2)
+
+    def _draw_lane_box(fig, rect, title, items, fs=6.5):
+        if not items:
+            return
+        leg_ax = fig.add_axes(rect)
+        leg_ax.set_axis_off()
+        y = 0.98
+        item_count = len(items)
+        fs = min(fs, 8.0 if item_count <= 5 else 7.0 if item_count <= 8 else 6.0)
+        line_h = min(0.150 if fs >= 7.4 else 0.125, 0.86 / max(1, item_count + 1))
+        leg_ax.text(0.0, y, title, transform=leg_ax.transAxes, ha="left", va="top",
+                    fontsize=fs + 0.6, fontweight="bold", color="#222222")
+        y -= line_h
+        for item in items:
+            text, color = item if isinstance(item, tuple) else (str(item), None)
+            x = 0.0
+            if color:
+                leg_ax.add_patch(mpatches.Rectangle((0.0, y - line_h * 0.62), 0.060, line_h * 0.54,
+                                                    transform=leg_ax.transAxes, facecolor=color,
+                                                    edgecolor="#333333", linewidth=0.4))
+                x = 0.075
+            leg_ax.text(x, y, text, transform=leg_ax.transAxes, ha="left", va="top",
+                        fontsize=fs, color="#222222", linespacing=0.90)
+            y -= line_h
+
+    def _draw_right_index(fig, day_events, wf_all_text, wf_fs):
+        client_items, planning_color_items, prestation_items = _legend_items(day_events)
+
+        plan_items = [(audit_shorten_text(label, 28), color or "#bdbdbd") for label, color in planning_color_items]
+        prest_items = []
+        for code, desc, color in prestation_items:
+            label = f"{code} {desc}".strip()
+            prest_items.append((audit_shorten_text(label, 28), color or "#2ca02c"))
+
+        _draw_header_indexes(fig, plan_items, prest_items)
+        _draw_client_index_box(fig, [0.875, 0.365, 0.12, 0.365], client_items)
+        fig.text(0.875, 0.285, wf_all_text, ha="left", va="top", fontsize=wf_fs,
+                 family="monospace", color="#222222",
+                 bbox=dict(facecolor="#ffffff", edgecolor="#cfcfcf", boxstyle="round,pad=0.38", alpha=0.96))
+
     def _day_bounds(day_events, day_str, min_hours=16):
         if day_events.empty:
             base = pd.Timestamp(f"{day_str} 00:00:00")
@@ -1538,6 +1750,26 @@ def audit_build_day_fig(data_ctx: dict, result: dict, cid: str, date_str: str):
             ax.text(xx, 2.45, f"{h}h", ha="center", va="bottom", fontsize=10, color="#6f6f6f", zorder=6, clip_on=False)
 
     def _draw_day(ax, day_events):
+        def _draw_client_id_label(mid_num, y_pos, client_nr, kind):
+            client_nr = audit_shorten_text(client_nr, 14)
+            if len(client_nr) > 4:
+                prefix, suffix = client_nr[:-4], client_nr[-4:]
+            else:
+                prefix, suffix = "", client_nr
+            box_color = "#111111" if kind == "Planning" else "#202020"
+            bbox = dict(facecolor=box_color, edgecolor="none", alpha=0.62, pad=0.12)
+            if prefix:
+                ax.annotate(
+                    prefix, xy=(mid_num, y_pos), xytext=(0, -17), textcoords="offset points",
+                    ha="center", va="center", rotation=90, fontsize=5.6, color="#ffffff",
+                    fontweight="bold", zorder=7, clip_on=True,
+                )
+            ax.annotate(
+                suffix, xy=(mid_num, y_pos), xytext=(0, 5), textcoords="offset points",
+                ha="center", va="center", rotation=90, fontsize=9.4, color="#ffffff",
+                fontweight="bold", zorder=7, clip_on=True, bbox=bbox,
+            )
+
         for _, rr in day_events.iterrows():
             left = _to_ln(rr["left"])
             right = _to_ln(rr["right"])
@@ -1555,6 +1787,11 @@ def audit_build_day_fig(data_ctx: dict, result: dict, cid: str, date_str: str):
             if pd.notna(mid) and str(lab).strip():
                 ax.text(mdates.date2num(mid), rr["label_y"], lab, ha="center", va="center", fontsize=8.5,
                         color=rr["label_color"], zorder=6, clip_on=False, bbox=dict(facecolor="white", edgecolor="none", alpha=0.55, pad=0.18))
+            if str(rr["kind"]) in ["RDA_ORIG", "Planning"]:
+                client_nr = audit_clean_legend_text(rr.get("client_nr", ""))
+                width_min = audit_duration_mins(left, right)
+                if pd.notna(mid) and client_nr and pd.notna(width_min) and width_min >= 5:
+                    _draw_client_id_label(mdates.date2num(mid), y, client_nr, str(rr["kind"]))
             if str(rr["kind"]) == "WF":
                 wf_idx = rr.get("wf_index", np.nan)
                 if pd.notna(mid) and pd.notna(wf_idx):
@@ -1618,11 +1855,10 @@ def audit_build_day_fig(data_ctx: dict, result: dict, cid: str, date_str: str):
     fig.text(0.5, 0.915, subtitle, ha="center", va="center", fontsize=9.2, color="#333333")
     fig.text(0.105, 0.875, prev_rest_text, ha="left", va="top", fontsize=8.7, family="monospace", color="#222222",
              bbox=dict(facecolor="#ffffff", edgecolor="#cfcfcf", boxstyle="round,pad=0.35", alpha=0.96))
-    fig.text(0.775, 0.875, next_rest_text, ha="right", va="top", fontsize=8.7, family="monospace", color="#222222",
+    fig.text(0.855, 0.875, next_rest_text, ha="right", va="top", fontsize=8.7, family="monospace", color="#222222",
              bbox=dict(facecolor="#ffffff", edgecolor="#cfcfcf", boxstyle="round,pad=0.35", alpha=0.96))
-    fig.text(0.805, 0.775, wf_all_text, ha="left", va="top", fontsize=wf_fs, family="monospace", color="#222222",
-             bbox=dict(facecolor="#ffffff", edgecolor="#cfcfcf", boxstyle="round,pad=0.45", alpha=0.96))
-    fig.subplots_adjust(left=0.10, right=0.775, top=0.79, bottom=0.12)
+    _draw_right_index(fig, day_events, wf_all_text, wf_fs)
+    fig.subplots_adjust(left=0.10, right=0.855, top=0.72, bottom=0.12)
     return fig
 
 
