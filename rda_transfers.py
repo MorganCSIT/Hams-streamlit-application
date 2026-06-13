@@ -1004,12 +1004,6 @@ def _transfer_inputs(key_prefix: str):
     target_label = config_cols[1].selectbox("UO cible", target_options, index=default_target_idx, key=f"{key_prefix}_target")
     output_name = config_cols[2].text_input("Nom du dossier", value=f"RDA {datetime.now().strftime('%m%Y')}", key=f"{key_prefix}_output")
     nx_path = ""
-    excluded_codes_raw = st.text_input(
-        "Prestations à exclure du transfert",
-        value="",
-        placeholder="Exemple: 16011,909,16009,195",
-        key=f"{key_prefix}_excluded",
-    )
     needs_mapping = source_label != target_label
     ready = rda_file is not None and (mapping_file is not None or not needs_mapping)
     if not ready:
@@ -1019,7 +1013,7 @@ def _transfer_inputs(key_prefix: str):
             st.info("Ajoutez le fichier Mapping pour un transfert entre deux UO différentes.")
     elif source_label == target_label:
         st.caption("Mapping optionnel: la source et la cible sont identiques, les IDs client/collab sont conservés.")
-    return rda_file, mapping_file, source_label, target_label, output_name, nx_path, excluded_codes_raw, ready
+    return rda_file, mapping_file, source_label, target_label, output_name, nx_path, ready
 
 
 def _run_button(label: str, key: str) -> bool:
@@ -1067,11 +1061,8 @@ def _render_adjustment_section() -> None:
 
 def _render_uo_transfer_section() -> None:
     st.subheader("Transfert UO vers UO")
-    st.caption("Prépare un transfert Nexus vers l'UO cible. Les prestations exclues ne sont pas exportées.")
-    rda_file, mapping_file, source_label, target_label, output_name, nx_path, excluded_codes_raw, ready = _transfer_inputs("rda_transfer")
-    excluded_codes = _parse_code_set(excluded_codes_raw)
-    if excluded_codes:
-        st.caption(f"Prestations exclues: {', '.join(sorted(excluded_codes))}")
+    st.caption("Prépare un transfert Nexus vers l'UO cible.")
+    rda_file, mapping_file, source_label, target_label, output_name, nx_path, ready = _transfer_inputs("rda_transfer")
     result = st.session_state.get("rda_transfer_result")
     action_cols = st.columns([2, 1])
     with action_cols[0]:
@@ -1081,7 +1072,7 @@ def _render_uo_transfer_section() -> None:
         render_blocking_run_warning()
         with st.spinner("Préparation du transfert UO vers UO..."):
             df = _read_uploaded_df(rda_file)
-            result = _transfer_excluding_codes_run(df, mapping_file, source_label, target_label, output_name, excluded_codes, nx_path)
+            result = _transfer_excluding_codes_run(df, mapping_file, source_label, target_label, output_name, set(), nx_path)
             _store_result("rda_transfer_result", result)
     result = st.session_state.get("rda_transfer_result")
     with action_cols[1]:
