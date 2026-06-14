@@ -1626,7 +1626,7 @@ def audit_build_day_fig(data_ctx: dict, result: dict, cid: str, date_str: str):
         if not client_items:
             return
         rows = len(client_items)
-        fs = 7.2 if rows <= 8 else 6.4 if rows <= 12 else 5.6
+        fs = 8.8 if rows <= 8 else 8.0 if rows <= 12 else 7.2
         ax_client = fig.add_axes(rect)
         ax_client.set_axis_off()
         ax_client.text(0.0, 1.0, "CLIENTS", transform=ax_client.transAxes,
@@ -1637,7 +1637,7 @@ def audit_build_day_fig(data_ctx: dict, result: dict, cid: str, date_str: str):
             row = idx
             x = 0.0
             y = top_y - row * row_step
-            max_name_len = 21
+            max_name_len = 24
             client_txt = audit_shorten_text(client_nr, 9)
             if len(client_txt) > 4:
                 client_prefix, client_suffix = client_txt[:-4], client_txt[-4:]
@@ -1703,8 +1703,8 @@ def audit_build_day_fig(data_ctx: dict, result: dict, cid: str, date_str: str):
             prest_items.append((audit_shorten_text(label, 28), color or "#2ca02c"))
 
         _draw_header_indexes(fig, plan_items, prest_items)
-        _draw_client_index_box(fig, [0.875, 0.365, 0.12, 0.365], client_items)
-        fig.text(0.875, 0.285, wf_all_text, ha="left", va="top", fontsize=wf_fs,
+        _draw_client_index_box(fig, [0.858, 0.355, 0.137, 0.375], client_items)
+        fig.text(0.858, 0.285, wf_all_text, ha="left", va="top", fontsize=wf_fs,
                  family="monospace", color="#222222",
                  bbox=dict(facecolor="#ffffff", edgecolor="#cfcfcf", boxstyle="round,pad=0.38", alpha=0.96))
 
@@ -1838,7 +1838,7 @@ def audit_build_day_fig(data_ctx: dict, result: dict, cid: str, date_str: str):
     ax.set_ylim(-0.52, 2.72)
     ax.margins(x=0, y=0)
     ax.set_yticks([0.0, 1.0, 2.0])
-    ax.set_yticklabels(["WF Trips", "RDA Original", "Planning"], fontsize=11.5)
+    ax.set_yticklabels(["WF", "RDA", "Plan"], fontsize=11.5)
     span_hours = max(1.0, (right_bound - left_bound).total_seconds() / 3600.0)
     major_interval = 1 if span_hours <= 14 else 2 if span_hours <= 22 else 3
     ax.xaxis.set_major_locator(mdates.HourLocator(interval=major_interval))
@@ -1855,10 +1855,10 @@ def audit_build_day_fig(data_ctx: dict, result: dict, cid: str, date_str: str):
     fig.text(0.5, 0.915, subtitle, ha="center", va="center", fontsize=9.2, color="#333333")
     fig.text(0.105, 0.875, prev_rest_text, ha="left", va="top", fontsize=8.7, family="monospace", color="#222222",
              bbox=dict(facecolor="#ffffff", edgecolor="#cfcfcf", boxstyle="round,pad=0.35", alpha=0.96))
-    fig.text(0.855, 0.875, next_rest_text, ha="right", va="top", fontsize=8.7, family="monospace", color="#222222",
+    fig.text(0.838, 0.875, next_rest_text, ha="right", va="top", fontsize=8.7, family="monospace", color="#222222",
              bbox=dict(facecolor="#ffffff", edgecolor="#cfcfcf", boxstyle="round,pad=0.35", alpha=0.96))
     _draw_right_index(fig, day_events, wf_all_text, wf_fs)
-    fig.subplots_adjust(left=0.10, right=0.855, top=0.72, bottom=0.12)
+    fig.subplots_adjust(left=0.065, right=0.855, top=0.72, bottom=0.12)
     return fig
 
 
