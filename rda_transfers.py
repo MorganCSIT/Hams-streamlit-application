@@ -1080,11 +1080,17 @@ def _render_uo_transfer_section() -> None:
     _show_stored_result("rda_transfer_result", "rda_transfer")
 
 
-def render_rda_task() -> None:
+def render_rda_task(nexus_renderer=None) -> None:
     st.title("Transferts RDA")
-    st.caption("Choisissez si vous voulez reconstruire le RDA en 15 minutes ou préparer un transfert entre deux UO. Les batchs Nexus sont générés, mais pas exécutés depuis l'application.")
-    tabs = st.tabs(["Ajustement 15 minutes", "Transfert UO vers UO"])
+    st.caption("Ajustez un RDA, préparez un transfert entre UO ou contrôlez et lancez un transfert vers Nexus.")
+    tab_labels = ["Ajustement 15 minutes", "Transfert UO vers UO"]
+    if nexus_renderer is not None:
+        tab_labels.append("Transfert vers Nexus")
+    tabs = st.tabs(tab_labels)
     with tabs[0]:
         _render_adjustment_section()
     with tabs[1]:
         _render_uo_transfer_section()
+    if nexus_renderer is not None:
+        with tabs[2]:
+            nexus_renderer(embedded=True)

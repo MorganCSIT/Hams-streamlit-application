@@ -6,6 +6,7 @@ import app_config as _app_config
 import audit_webfleet_rda as _audit_webfleet_rda
 import ltr_checks as _ltr_checks
 import merge_files as _merge_files
+import nexus_batch_runner as _nexus_batch_runner
 import rda_transfers as _rda_transfers
 import ui_common as _ui_common
 import webfleet as _webfleet
@@ -14,6 +15,7 @@ _app_config = importlib.reload(_app_config)
 _ui_common = importlib.reload(_ui_common)
 _webfleet = importlib.reload(_webfleet)
 _merge_files = importlib.reload(_merge_files)
+_nexus_batch_runner = importlib.reload(_nexus_batch_runner)
 _rda_transfers = importlib.reload(_rda_transfers)
 _ltr_checks = importlib.reload(_ltr_checks)
 _audit_webfleet_rda = importlib.reload(_audit_webfleet_rda)
@@ -22,6 +24,7 @@ TASKS = _app_config.TASKS
 render_audit_task = _audit_webfleet_rda.render_audit_task
 render_ltr_task = _ltr_checks.render_ltr_task
 render_merge_task = _merge_files.render_merge_task
+render_nexus_batch_runner_task = _nexus_batch_runner.render_nexus_batch_runner_task
 render_rda_task = _rda_transfers.render_rda_task
 render_webfleet_task = _webfleet.render_webfleet_task
 
@@ -165,8 +168,8 @@ def render_home_task() -> None:
         },
         {
             "Section": "Transferts RDA",
-            "Entrées": "Fichier RDA, mapping si transfert entre UO, paramètres Nexus",
-            "Sorties": "Dossier zip avec fichiers Nexus, contrôles QA et fichiers générés",
+            "Entrées": "RDA brut ou Nexus préparé, mapping UO, chemin nx-spi-client et identifiants Nexus",
+            "Sorties": "Fichiers Nexus, contrôles QA, exécution du batch et log de transfert",
         },
         {
             "Section": "Contrôles LTR",
@@ -394,7 +397,7 @@ def main() -> None:
         elif selected_key == "merge":
             render_merge_task()
         elif selected_key == "rda":
-            render_rda_task()
+            render_rda_task(render_nexus_batch_runner_task)
         elif selected_key == "ltr":
             render_ltr_task()
         elif selected_key == "audit":

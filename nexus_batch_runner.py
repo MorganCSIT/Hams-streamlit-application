@@ -1,351 +1,456 @@
+import hashlib
+
 from app_config import *
-from ui_common import render_blocking_run_warning, safe_folder_name
+from rda_transfers import (
+    RDA_ALLOWED_EXTENSIONS,
+    _detect_columns,
+    _duration_from_min,
+    _nexus_df,
+    _read_uploaded_df,
+    _to_min,
+    _write_batch_file,
+)
+from ui_common import render_blocking_run_warning, render_download_for_path, safe_folder_name
 
 
-BATCH_GROUPS = [
-    "01_Standard_Transfer",
-    "01_All_Collabs_One_CSV",
-    "02_Collabs_With_61010_One_CSV",
-    "02_Whitelisted_Ready_For_101",
-    "03_Per_Collab_Separate",
+NEXUS_EXE_NAME = "Asebis.Client.StarterCommand.exe"
+NEXUS_IMPORT_TYPE = "ImportLeistungen_CSV"
+NEXUS_COLUMNS = [
+    "Datum",
+    "Von",
+    "Bis",
+    "Leistungscode",
+    "Dauer_verrechnet",
+    "OE",
+    "KD-Nr",
+    "Klient",
+    "Einsatzgrund",
+    "Mitarbeiter-ID",
 ]
 
 
 @dataclass
-class BatchCandidate:
+class PreparedNexusTransfer:
+    fingerprint: str
+    output_dir: Path
+    csv_path: Path
+    map_path: Path
     batch_path: Path
-    group: str
-    exe_text: str
-    exe_path: Path | None
-    csv_text: str
-    csv_path: Path | None
-    map_text: str
-    map_path: Path | None
+    log_path: Path
+    nexus_df: pd.DataFrame
+    map_df: pd.DataFrame
+    exe_path: Path
     oe: str
-    import_type: str
-    args: list[str]
-    status: str
-    reason: str
-
-    @property
-    def runnable(self) -> bool:
-        return self.status == "Runnable"
 
 
-def _latest_rda_folder() -> str:
-    root = APP_ROOT / RDA_OUTPUT_FOLDER
-    if not root.exists():
+def _client_executable(folder_text: str) -> Path:
+    folder = Path(folder_text.strip().strip('"')).expanduser()
+    return folder / NEXUS_EXE_NAME
+
+
+def _validation_rows(raw_df: pd.DataFrame, cols, nexus_df: pd.DataFrame) -> tuple[pd.DataFrame, bool]:
+    rows: list[dict] = []
+
+    def add(level: str, check: str, value, detail: str) -> None:
+        rows.append({"Statut": level, "Contrôle": check, "Résultat": value, "Détail": detail})
+
+    add("OK" if len(raw_df) else "Erreur", "Lignes RDA", len(raw_df), "Le fichier ne doit pas être vide.")
+
+    invalid_dates = int(nexus_df["Datum"].eq("").sum())
+    add("OK" if invalid_dates == 0 else "Erreur", "Dates invalides", invalid_dates, "Toutes les dates doivent être lisibles.")
+
+    start_minutes = raw_df[cols.start].apply(_to_min)
+    end_minutes = raw_df[cols.end].apply(_to_min)
+    invalid_times = int((start_minutes.isna() | end_minutes.isna()).sum())
+    add("OK" if invalid_times == 0 else "Erreur", "Heures invalides", invalid_times, "Début et fin sont obligatoires.")
+
+    durations = pd.to_numeric(raw_df[cols.duration], errors="coerce")
+    invalid_durations = int(durations.isna().sum())
+    negative_durations = int((durations.fillna(0) < 0).sum())
+    add("OK" if invalid_durations == 0 else "Erreur", "Durées non numériques", invalid_durations, "La durée doit être numérique.")
+    add("OK" if negative_durations == 0 else "Erreur", "Durées négatives", negative_durations, "La durée ne peut pas être négative.")
+
+    calculated = pd.Series(
+        [_duration_from_min(start, end) for start, end in zip(start_minutes, end_minutes)],
+        index=raw_df.index,
+        dtype="float64",
+    )
+    duration_mismatches = int(
+        (
+            durations.notna()
+            & calculated.notna()
+            & (durations.round().astype("Int64") != calculated.round().astype("Int64"))
+        ).sum()
+    )
+    add(
+        "OK" if duration_mismatches == 0 else "Erreur",
+        "Durée différente de Début/Fin",
+        duration_mismatches,
+        "Corrigez les lignes avant le transfert.",
+    )
+
+    empty_codes = int(nexus_df["Leistungscode"].astype(str).str.strip().eq("").sum())
+    add("OK" if empty_codes == 0 else "Erreur", "Prestations vides", empty_codes, "Chaque ligne doit avoir un code prestation.")
+
+    raw_clients = raw_df[cols.client]
+    missing_clients = raw_clients.isna() | raw_clients.astype(str).str.strip().eq("")
+    numeric_clients = pd.to_numeric(raw_clients, errors="coerce")
+    invalid_clients = int((~missing_clients & numeric_clients.isna()).sum())
+    expected_kd = numeric_clients.fillna(0).astype(int)
+    expected_reason = expected_kd.map(lambda value: 0 if value == 0 else 2)
+    client_values_are_correct = bool(
+        nexus_df["KD-Nr"].eq(expected_kd).all()
+        and nexus_df["Klient"].eq(0).all()
+        and nexus_df["Einsatzgrund"].eq(expected_reason).all()
+    )
+    add(
+        "OK" if invalid_clients == 0 else "Erreur",
+        "Clients invalides",
+        invalid_clients,
+        "Une valeur vide est autorisée; une valeur renseignée doit être numérique.",
+    )
+    add(
+        "OK" if client_values_are_correct else "Erreur",
+        "Valeurs client Nexus",
+        int(missing_clients.sum()),
+        "Client absent: 0/0/0. Client présent: KD-Nr/0/2.",
+    )
+
+    collaborators = pd.to_numeric(raw_df[cols.collab], errors="coerce")
+    invalid_collaborators = int(collaborators.isna().sum())
+    add(
+        "OK" if invalid_collaborators == 0 else "Erreur",
+        "Collaborateurs invalides",
+        invalid_collaborators,
+        "Les identifiants collaborateur doivent être numériques.",
+    )
+
+    duplicates = int(nexus_df.duplicated().sum())
+    add("OK" if duplicates == 0 else "Attention", "Lignes dupliquées", duplicates, "Vérifiez les doublons avant le transfert.")
+    add("Info", "Minutes totales", int(durations.fillna(0).sum()), "Somme de Durée dans le RDA brut.")
+
+    checks = pd.DataFrame(rows)
+    return checks, bool((checks["Statut"] == "Erreur").any())
+
+
+def _normalize_oe(value) -> str:
+    if pd.isna(value):
         return ""
-    folders = [path for path in root.iterdir() if path.is_dir() and path.name != "BatchRunLogs"]
-    if not folders:
-        return ""
-    return str(max(folders, key=lambda path: path.stat().st_mtime))
-
-
-def _resolve_from(base: Path, value: str) -> Path | None:
-    if not value:
-        return None
-    raw = Path(value)
-    if raw.is_absolute():
-        return raw
-    return (base / raw).resolve()
-
-
-def _strip_quotes(value: str) -> str:
-    text = value.strip()
-    if len(text) >= 2 and text[0] == '"' and text[-1] == '"':
-        return text[1:-1]
+    text = str(value).strip()
+    if text.endswith(".0") and text[:-2].isdigit():
+        return text[:-2]
     return text
 
 
-def _extract_params(args_text: str) -> tuple[dict[str, str], list[str]]:
-    params: dict[str, str] = {}
-    args: list[str] = []
-    pattern = re.compile(r"/(?P<key>u|p|t|o|f|map)=(?P<value>\"[^\"]*\"|\S+)|(?P<verbose>/v)\b", re.IGNORECASE)
-    for match in pattern.finditer(args_text):
-        if match.group("verbose"):
-            args.append("/v")
-            continue
-        key = match.group("key").lower()
-        value = _strip_quotes(match.group("value"))
-        params[key] = value
-        args.append(f"/{key}={value}")
-    return params, args
+def _validate_prepared_nexus(nexus_df: pd.DataFrame) -> tuple[pd.DataFrame, bool, str]:
+    rows: list[dict] = []
+
+    def add(level: str, check: str, value, detail: str) -> None:
+        rows.append({"Statut": level, "Contrôle": check, "Résultat": value, "Détail": detail})
+
+    add("OK" if len(nexus_df) else "Erreur", "Lignes Nexus", len(nexus_df), "Le fichier ne doit pas être vide.")
+
+    dates = pd.to_datetime(nexus_df["Datum"], dayfirst=True, errors="coerce")
+    invalid_dates = int(dates.isna().sum())
+    add("OK" if invalid_dates == 0 else "Erreur", "Dates invalides", invalid_dates, "Datum doit contenir une date lisible.")
+
+    starts = nexus_df["Von"].apply(_to_min)
+    ends = nexus_df["Bis"].apply(_to_min)
+    invalid_times = int((starts.isna() | ends.isna()).sum())
+    add("OK" if invalid_times == 0 else "Erreur", "Heures invalides", invalid_times, "Von et Bis sont obligatoires.")
+
+    durations = pd.to_numeric(nexus_df["Dauer_verrechnet"], errors="coerce")
+    invalid_durations = int(durations.isna().sum())
+    negative_durations = int(durations.fillna(0).lt(0).sum())
+    calculated = pd.Series(
+        [_duration_from_min(start, end) for start, end in zip(starts, ends)],
+        index=nexus_df.index,
+        dtype="float64",
+    )
+    duration_mismatches = int(
+        (
+            durations.notna()
+            & calculated.notna()
+            & (durations.round().astype("Int64") != calculated.round().astype("Int64"))
+        ).sum()
+    )
+    add("OK" if invalid_durations == 0 else "Erreur", "Durées non numériques", invalid_durations, "Dauer_verrechnet doit être numérique.")
+    add("OK" if negative_durations == 0 else "Erreur", "Durées négatives", negative_durations, "La durée ne peut pas être négative.")
+    add("OK" if duration_mismatches == 0 else "Erreur", "Durée différente de Von/Bis", duration_mismatches, "Corrigez les lignes avant le transfert.")
+
+    empty_codes = int(nexus_df["Leistungscode"].fillna("").astype(str).str.strip().eq("").sum())
+    add("OK" if empty_codes == 0 else "Erreur", "Prestations vides", empty_codes, "Leistungscode est obligatoire.")
+
+    oe_values = sorted({_normalize_oe(value) for value in nexus_df["OE"] if _normalize_oe(value)})
+    oe = oe_values[0] if len(oe_values) == 1 else ""
+    add(
+        "OK" if len(oe_values) == 1 else "Erreur",
+        "OE unique",
+        oe if oe else len(oe_values),
+        "Le fichier préparé doit contenir exactement une OE.",
+    )
+
+    kd = pd.to_numeric(nexus_df["KD-Nr"], errors="coerce")
+    klient = pd.to_numeric(nexus_df["Klient"], errors="coerce")
+    reason = pd.to_numeric(nexus_df["Einsatzgrund"], errors="coerce")
+    invalid_client_values = int((kd.isna() | klient.isna() | reason.isna()).sum())
+    expected_reason = kd.fillna(0).map(lambda value: 0 if value == 0 else 2)
+    inconsistent_clients = int((klient.fillna(-1).ne(0) | reason.fillna(-1).ne(expected_reason)).sum())
+    add("OK" if invalid_client_values == 0 else "Erreur", "Valeurs client numériques", invalid_client_values, "KD-Nr, Klient et Einsatzgrund doivent être numériques.")
+    add("OK" if inconsistent_clients == 0 else "Erreur", "Règle client", inconsistent_clients, "Sans client: 0/0/0. Avec client: KD-Nr/0/2.")
+
+    collaborators = pd.to_numeric(nexus_df["Mitarbeiter-ID"], errors="coerce")
+    invalid_collaborators = int(collaborators.isna().sum())
+    add("OK" if invalid_collaborators == 0 else "Erreur", "Collaborateurs invalides", invalid_collaborators, "Mitarbeiter-ID doit être numérique.")
+
+    duplicates = int(nexus_df.duplicated().sum())
+    add("OK" if duplicates == 0 else "Attention", "Lignes dupliquées", duplicates, "Vérifiez les doublons avant le transfert.")
+    add("Info", "Minutes totales", int(durations.fillna(0).sum()), "Somme de Dauer_verrechnet.")
+
+    checks = pd.DataFrame(rows)
+    return checks, bool((checks["Statut"] == "Erreur").any()), oe
 
 
-def _parse_batch(batch_path: Path) -> BatchCandidate:
-    try:
-        text = batch_path.read_text(encoding="utf-8", errors="replace")
-    except Exception as exc:
-        return BatchCandidate(batch_path, _batch_group(batch_path), "", None, "", None, "", None, "", "", [], "Blocked", f"Lecture impossible: {exc}")
+def _fingerprint(uploaded_file, oe: str, exe_path: Path) -> str:
+    digest = hashlib.sha256()
+    digest.update(uploaded_file.getvalue())
+    digest.update(oe.encode("utf-8"))
+    digest.update(str(exe_path.resolve()).encode("utf-8", errors="replace"))
+    return digest.hexdigest()
 
-    command_line = next((line.strip() for line in text.splitlines() if "Asebis.Client.StarterCommand.exe" in line), "")
-    if not command_line:
-        return BatchCandidate(batch_path, _batch_group(batch_path), "", None, "", None, "", None, "", "", [], "Blocked", "Commande Nexus introuvable")
 
-    quoted = re.match(r'^"(?P<exe>[^"]*Asebis\.Client\.StarterCommand\.exe)"\s*(?P<args>.*)$', command_line, re.IGNORECASE)
-    unquoted = re.match(r"^(?P<exe>\S*Asebis\.Client\.StarterCommand\.exe)\s*(?P<args>.*)$", command_line, re.IGNORECASE)
-    match = quoted or unquoted
-    if not match:
-        return BatchCandidate(batch_path, _batch_group(batch_path), "", None, "", None, "", None, "", "", [], "Blocked", "Format de commande non reconnu")
+def _prepare_transfer(
+    fingerprint: str,
+    source_name: str,
+    nexus_df: pd.DataFrame,
+    map_df: pd.DataFrame,
+    exe_path: Path,
+    oe: str,
+) -> PreparedNexusTransfer:
+    root = get_session_output_root("NexusTransfers")
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_dir = root / f"{safe_folder_name(Path(source_name).stem)}_{timestamp}_{fingerprint[:8]}"
+    output_dir.mkdir(parents=True, exist_ok=True)
 
-    exe_text = match.group("exe")
-    params, nexus_args = _extract_params(match.group("args"))
-    exe_path = _resolve_from(batch_path.parent, exe_text)
-    csv_path = _resolve_from(batch_path.parent, params.get("f", ""))
-    map_path = _resolve_from(batch_path.parent, params.get("map", ""))
-    args = [str(exe_path)] + nexus_args if exe_path is not None else []
+    csv_path = output_dir / "RDA_Nexus.csv"
+    map_path = output_dir / "HAS_map.csv"
+    batch_path = output_dir / "RDA_Nexus_batch.bat"
+    log_path = output_dir / "RDA_Nexus_transfer.log"
 
-    missing = []
-    if exe_path is None or not exe_path.is_file():
-        missing.append("nx-spi-client/Asebis.Client.StarterCommand.exe")
-    if csv_path is None or not csv_path.is_file():
-        missing.append(params.get("f", "CSV"))
-    if map_path is None or not map_path.is_file():
-        missing.append(params.get("map", "map"))
-    if not params.get("o"):
-        missing.append("OE")
-    if not params.get("t"):
-        missing.append("type import")
+    nexus_df.to_csv(csv_path, index=False, sep=";", encoding="utf-8-sig")
+    map_df.to_csv(map_path, index=False, sep=";", encoding="utf-8-sig")
+    _write_batch_file(batch_path, csv_path.name, oe, map_path.name, str(exe_path))
 
-    status = "Blocked" if missing else "Runnable"
-    reason = f"Manquant: {', '.join(missing)}" if missing else ""
-    return BatchCandidate(
-        batch_path=batch_path,
-        group=_batch_group(batch_path),
-        exe_text=exe_text,
-        exe_path=exe_path,
-        csv_text=params.get("f", ""),
+    return PreparedNexusTransfer(
+        fingerprint=fingerprint,
+        output_dir=output_dir,
         csv_path=csv_path,
-        map_text=params.get("map", ""),
         map_path=map_path,
-        oe=params.get("o", ""),
-        import_type=params.get("t", ""),
-        args=args,
-        status=status,
-        reason=reason,
+        batch_path=batch_path,
+        log_path=log_path,
+        nexus_df=nexus_df,
+        map_df=map_df,
+        exe_path=exe_path,
+        oe=oe,
     )
 
 
-def _batch_group(batch_path: Path) -> str:
-    for part in batch_path.parts:
-        if part in BATCH_GROUPS:
-            return part
-    return "Autre"
-
-
-def _candidate_rows(candidates: list[BatchCandidate], package_root: Path) -> list[dict]:
-    rows = []
-    for idx, candidate in enumerate(candidates):
-        rows.append(
-            {
-                "ID": idx,
-                "Statut": candidate.status,
-                "Groupe": candidate.group,
-                "Batch": str(candidate.batch_path.relative_to(package_root)) if candidate.batch_path.is_relative_to(package_root) else str(candidate.batch_path),
-                "CSV": candidate.csv_text,
-                "Map": candidate.map_text,
-                "OE": candidate.oe,
-                "Type": candidate.import_type,
-                "Raison": candidate.reason,
-            }
+def _run_transfer(prepared: PreparedNexusTransfer, username: str, password: str) -> dict:
+    args = [
+        str(prepared.exe_path),
+        f"/u={username}",
+        f"/p={password}",
+        f"/t={NEXUS_IMPORT_TYPE}",
+        f"/o={prepared.oe}",
+        f"/f={prepared.csv_path.name}",
+        f"/map={prepared.map_path.name}",
+        "/v",
+    ]
+    started = datetime.now()
+    try:
+        result = subprocess.run(
+            args,
+            cwd=str(prepared.output_dir),
+            capture_output=True,
+            text=True,
+            errors="replace",
+            timeout=1800,
+            shell=False,
         )
-    return rows
+        ended = datetime.now()
+        status = "Réussi" if result.returncode == 0 else "Échec"
+        return_code = result.returncode
+        stdout = result.stdout or ""
+        stderr = result.stderr or ""
+    except Exception as exc:
+        ended = datetime.now()
+        status = "Erreur"
+        return_code = ""
+        stdout = ""
+        stderr = str(exc)
+
+    safe_command = " ".join([str(prepared.exe_path), f"/u={username}", "/p=********", *args[3:]])
+    log_text = (
+        f"Statut: {status}\n"
+        f"Début: {started.isoformat(timespec='seconds')}\n"
+        f"Fin: {ended.isoformat(timespec='seconds')}\n"
+        f"Durée secondes: {(ended - started).total_seconds():.1f}\n"
+        f"Code retour: {return_code}\n"
+        f"Commande: {safe_command}\n\n"
+        f"STDOUT\n------\n{stdout}\n\nSTDERR\n------\n{stderr}\n"
+    )
+    prepared.log_path.write_text(log_text, encoding="utf-8")
+    return {
+        "Statut": status,
+        "Code retour": return_code,
+        "Début": started.strftime("%Y-%m-%d %H:%M:%S"),
+        "Fin": ended.strftime("%Y-%m-%d %H:%M:%S"),
+        "Durée sec": round((ended - started).total_seconds(), 1),
+        "Log": log_text,
+    }
 
 
-def _scan_batches(package_root: Path) -> list[BatchCandidate]:
-    if not package_root.exists() or not package_root.is_dir():
-        return []
-    return [_parse_batch(path) for path in sorted(package_root.rglob("*.bat"))]
+def _render_prepared_downloads(prepared: PreparedNexusTransfer) -> None:
+    cols = st.columns(3)
+    with cols[0]:
+        render_download_for_path(prepared.map_path, "Télécharger HAS_map.csv", key="nexus_raw_map_download", width="stretch")
+    with cols[1]:
+        render_download_for_path(prepared.csv_path, "Télécharger le CSV Nexus", key="nexus_raw_csv_download", width="stretch")
+    with cols[2]:
+        render_download_for_path(prepared.batch_path, "Télécharger le batch", key="nexus_raw_batch_download", width="stretch")
 
 
-def _safe_extract_zip(uploaded_file) -> Path:
-    extract_root = APP_ROOT / RDA_OUTPUT_FOLDER / "UploadedBatchRuns"
-    extract_root.mkdir(parents=True, exist_ok=True)
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    target = extract_root / f"{safe_folder_name(Path(uploaded_file.name).stem)}_{timestamp}"
-    target.mkdir(parents=True, exist_ok=False)
-    target_resolved = target.resolve()
-
-    with zipfile.ZipFile(BytesIO(uploaded_file.getvalue())) as archive:
-        for member in archive.infolist():
-            destination = (target / member.filename).resolve()
-            if not str(destination).lower().startswith(str(target_resolved).lower()):
-                raise ValueError(f"Chemin dangereux dans le zip: {member.filename}")
-            if member.is_dir():
-                destination.mkdir(parents=True, exist_ok=True)
-                continue
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            with archive.open(member) as src, destination.open("wb") as dst:
-                shutil.copyfileobj(src, dst)
-    return target
-
-
-def _mask_arg(arg: str) -> str:
-    return "/p=********" if arg.lower().startswith("/p=") else arg
-
-
-def _log_text(candidate: BatchCandidate, result: subprocess.CompletedProcess, started: datetime, ended: datetime) -> str:
-    command = " ".join(_mask_arg(arg) for arg in candidate.args)
-    return (
-        f"Batch: {candidate.batch_path}\n"
-        f"Started: {started.isoformat(timespec='seconds')}\n"
-        f"Ended: {ended.isoformat(timespec='seconds')}\n"
-        f"Duration seconds: {(ended - started).total_seconds():.1f}\n"
-        f"Exit code: {result.returncode}\n"
-        f"Command: {command}\n\n"
-        "STDOUT\n"
-        "------\n"
-        f"{result.stdout or ''}\n\n"
-        "STDERR\n"
-        "------\n"
-        f"{result.stderr or ''}\n"
+def render_nexus_batch_runner_task(embedded: bool = False) -> None:
+    if embedded:
+        st.subheader("Transfert RDA vers Nexus")
+    else:
+        st.title("Transfert RDA vers Nexus")
+    st.caption("Chargez un RDA brut ou un fichier Nexus déjà préparé, contrôlez les données, puis lancez le transfert.")
+    st.info(
+        "Le chemin nx-spi-client est lu sur le PC qui exécute Streamlit. Avec un lien partagé, indiquez un chemin "
+        "présent sur le serveur Streamlit, pas sur le PC du navigateur."
     )
 
-
-def _run_batches(candidates: list[BatchCandidate], package_root: Path) -> tuple[pd.DataFrame, Path]:
-    log_root = APP_ROOT / RDA_OUTPUT_FOLDER / "BatchRunLogs"
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    run_log_dir = log_root / f"{safe_folder_name(package_root.name)}_{timestamp}"
-    run_log_dir.mkdir(parents=True, exist_ok=True)
-
-    rows = []
-    progress = st.progress(0)
-    status_box = st.empty()
-    for index, candidate in enumerate(candidates, start=1):
-        status_box.info(f"Exécution {index}/{len(candidates)}: {candidate.batch_path.name}")
-        started = datetime.now()
-        try:
-            result = subprocess.run(
-                candidate.args,
-                cwd=str(candidate.batch_path.parent),
-                capture_output=True,
-                text=True,
-                timeout=None,
-            )
-            ended = datetime.now()
-            outcome = "Réussi" if result.returncode == 0 else "Échec"
-            log_content = _log_text(candidate, result, started, ended)
-        except Exception as exc:
-            ended = datetime.now()
-            outcome = "Erreur"
-            log_content = (
-                f"Batch: {candidate.batch_path}\n"
-                f"Started: {started.isoformat(timespec='seconds')}\n"
-                f"Ended: {ended.isoformat(timespec='seconds')}\n"
-                f"Error: {exc}\n"
-            )
-            result = None
-
-        log_path = run_log_dir / f"{index:03d}_{safe_folder_name(candidate.batch_path.stem)}.log"
-        log_path.write_text(log_content, encoding="utf-8")
-        rows.append(
-            {
-                "Batch": str(candidate.batch_path.relative_to(package_root)) if candidate.batch_path.is_relative_to(package_root) else str(candidate.batch_path),
-                "Groupe": candidate.group,
-                "Statut": outcome,
-                "Code retour": "" if result is None else result.returncode,
-                "Début": started.strftime("%Y-%m-%d %H:%M:%S"),
-                "Fin": ended.strftime("%Y-%m-%d %H:%M:%S"),
-                "Durée sec": round((ended - started).total_seconds(), 1),
-                "Log": str(log_path),
-            }
+    input_mode = st.radio(
+        "Type de fichier d'entrée",
+        ["RDA brut", "Fichier Nexus déjà préparé"],
+        horizontal=True,
+        key="nexus_input_mode",
+    )
+    upload_col, path_col = st.columns(2)
+    if input_mode == "RDA brut":
+        input_file = upload_col.file_uploader("Fichier RDA brut", type=RDA_ALLOWED_EXTENSIONS, key="nexus_raw_rda")
+    else:
+        input_file = upload_col.file_uploader(
+            "Fichier Nexus préparé",
+            type=RDA_ALLOWED_EXTENSIONS,
+            key="nexus_prepared_file",
+            help="Colonnes attendues: Datum, Von, Bis, Leistungscode, Dauer_verrechnet, OE, KD-Nr, Klient, Einsatzgrund, Mitarbeiter-ID.",
         )
-        progress.progress(index / len(candidates))
+    nx_folder_text = path_col.text_input(
+        "Chemin local du dossier nx-spi-client",
+        placeholder=r"C:\Nexus\nx-spi-client",
+        key="nexus_raw_client_folder",
+    )
+    oe = ""
+    if input_mode == "RDA brut":
+        uo_label = st.selectbox("UO cible", list(RDA_OE_MAP.keys()), key="nexus_raw_uo")
+        oe = RDA_OE_MAP[uo_label]
 
-    summary = pd.DataFrame(rows)
-    summary.to_csv(run_log_dir / "summary.csv", index=False, encoding="utf-8-sig", sep=";")
-    status_box.success(f"Exécution terminée. Logs: {run_log_dir}")
-    return summary, run_log_dir
-
-
-def _render_run_results(summary: pd.DataFrame, log_dir: Path) -> None:
-    st.subheader("Résultats")
-    st.caption(f"Dossier de logs: {log_dir}")
-    st.dataframe(summary, use_container_width=True, hide_index=True)
-    for _, row in summary.iterrows():
-        log_path = Path(row["Log"])
-        with st.expander(f"{row['Statut']} - {row['Batch']}"):
-            if log_path.is_file():
-                st.code(log_path.read_text(encoding="utf-8", errors="replace"), language="text")
-            else:
-                st.warning("Log introuvable.")
-
-
-def render_nexus_batch_runner_task() -> None:
-    st.title("Exécution batch Nexus")
-    st.caption("Détecte les batchs Nexus générés, vérifie les CSV/maps et exécute seulement les batchs sélectionnés.")
-
-    input_tab, results_tab = st.tabs(["Détection et exécution", "Derniers résultats"])
-    with input_tab:
-        default_path = st.session_state.get("nexus_batch_package_path", _latest_rda_folder())
-        path_text = st.text_input("Dossier RDA local", value=default_path, key="nexus_batch_path")
-        if path_text != default_path:
-            st.session_state["nexus_batch_package_path"] = path_text
-        uploaded_zip = st.file_uploader("Ou déposer un dossier complet en .zip", type=["zip"], key="nexus_batch_zip")
-
-        if uploaded_zip is not None and st.button("Extraire le zip", type="primary", key="nexus_batch_extract"):
-            try:
-                extracted = _safe_extract_zip(uploaded_zip)
-                st.session_state["nexus_batch_package_path"] = str(extracted)
-                path_text = str(extracted)
-                st.success(f"Zip extrait dans: {extracted}")
-            except Exception as exc:
-                st.exception(exc)
-                return
-
-        if not path_text.strip():
-            st.warning("Indiquez un dossier RDA local ou extrayez un zip.")
-            return
-
-        package_root = Path(path_text.strip().strip('"')).expanduser()
-        candidates = _scan_batches(package_root)
-        runnable = [candidate for candidate in candidates if candidate.runnable]
-        blocked = [candidate for candidate in candidates if not candidate.runnable]
-
-        metric_cols = st.columns(4)
-        metric_cols[0].metric("Batchs détectés", f"{len(candidates):,}")
-        metric_cols[1].metric("Exécutables", f"{len(runnable):,}")
-        metric_cols[2].metric("Bloqués", f"{len(blocked):,}")
-        metric_cols[3].metric("Dossier", "OK" if package_root.is_dir() else "Introuvable")
-
-        if not package_root.is_dir():
-            st.warning("Indiquez un dossier RDA local valide ou extrayez un zip.")
-            return
-        if not candidates:
-            st.info("Aucun fichier .bat détecté dans ce dossier.")
-            return
-
-        rows = _candidate_rows(candidates, package_root)
-        st.subheader("Aperçu")
-        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
-
-        options = [
-            f"{row['ID']} | {row['Groupe']} | {row['Batch']}"
-            for row in rows
-            if candidates[row["ID"]].runnable
-        ]
-        selected_options = st.multiselect("Batchs à exécuter", options=options, key="nexus_batch_selected")
-        selected_ids = [int(option.split(" | ", 1)[0]) for option in selected_options]
-        selected_candidates = [candidates[index] for index in selected_ids]
-
-        confirm = st.checkbox(
-            "Je confirme que ces imports Nexus doivent être exécutés depuis cette machine.",
-            key="nexus_batch_confirm",
-        )
-        run_disabled = not selected_candidates or not confirm
-        if st.button("Exécuter les batchs sélectionnés", type="primary", disabled=run_disabled, key="nexus_batch_run", width="stretch"):
-            render_blocking_run_warning()
-            with st.spinner("Exécution des batchs Nexus..."):
-                summary, log_dir = _run_batches(selected_candidates, package_root)
-            st.session_state["nexus_batch_last_summary"] = summary
-            st.session_state["nexus_batch_last_log_dir"] = str(log_dir)
-            _render_run_results(summary, log_dir)
-
-    with results_tab:
-        summary = st.session_state.get("nexus_batch_last_summary")
-        log_dir = st.session_state.get("nexus_batch_last_log_dir")
-        if summary is None or not log_dir:
-            st.info("Aucune exécution dans cette session.")
+    exe_path = _client_executable(nx_folder_text) if nx_folder_text.strip() else None
+    if nx_folder_text.strip():
+        if exe_path and exe_path.is_file():
+            st.success(f"Client Nexus trouvé: {exe_path}")
         else:
-            _render_run_results(summary, Path(log_dir))
+            st.error(f"Client Nexus introuvable: {exe_path}")
+
+    if input_file is None:
+        expected = "un fichier RDA brut" if input_mode == "RDA brut" else "un fichier Nexus déjà préparé"
+        st.warning(f"Ajoutez {expected} pour afficher les contrôles.")
+        return
+
+    try:
+        source_df = _read_uploaded_df(input_file)
+        if input_mode == "RDA brut":
+            if not any(column in source_df.columns for column in RDA_CLIENT_COLS):
+                source_df["N° du client"] = 0
+            cols = _detect_columns(source_df)
+            nexus_df = _nexus_df(source_df, cols, oe)
+            checks, has_blocking_errors = _validation_rows(source_df, cols, nexus_df)
+            source_tab_label = "RDA brut"
+        else:
+            source_df.columns = [str(column).strip() for column in source_df.columns]
+            missing_columns = [column for column in NEXUS_COLUMNS if column not in source_df.columns]
+            if missing_columns:
+                raise ValueError(f"Colonnes Nexus manquantes: {', '.join(missing_columns)}")
+            nexus_df = source_df[NEXUS_COLUMNS].copy()
+            nexus_df["OE"] = nexus_df["OE"].map(_normalize_oe)
+            checks, has_blocking_errors, oe = _validate_prepared_nexus(nexus_df)
+            source_tab_label = "Fichier préparé chargé"
+    except Exception as exc:
+        st.error(f"Impossible de préparer le transfert: {exc}")
+        return
+
+    map_codes = sorted(code for code in nexus_df["Leistungscode"].dropna().astype(str).str.strip().unique() if code)
+    map_df = pd.DataFrame({"Code_ext": map_codes, "Leistungstarif_nummer": map_codes})
+
+    error_count = int((checks["Statut"] == "Erreur").sum())
+    warning_count = int((checks["Statut"] == "Attention").sum())
+    metric_cols = st.columns(4)
+    metric_cols[0].metric("Lignes", f"{len(nexus_df):,}")
+    metric_cols[1].metric("Prestations", f"{len(map_df):,}")
+    metric_cols[2].metric("Erreurs", error_count)
+    metric_cols[3].metric("Avertissements", warning_count)
+
+    st.subheader("Contrôles avant transfert")
+    st.dataframe(checks, width="stretch", hide_index=True)
+    preview_tab, nexus_tab, map_tab = st.tabs([source_tab_label, "CSV Nexus utilisé", "HAS_map"])
+    with preview_tab:
+        st.dataframe(source_df, width="stretch", hide_index=True)
+    with nexus_tab:
+        st.dataframe(nexus_df, width="stretch", hide_index=True)
+    with map_tab:
+        st.dataframe(map_df, width="stretch", hide_index=True)
+
+    if has_blocking_errors:
+        st.error("Le transfert est bloqué. Corrigez les erreurs indiquées dans le fichier.")
+        return
+    if exe_path is None or not exe_path.is_file():
+        st.warning("Indiquez un dossier nx-spi-client valide pour générer et exécuter le batch.")
+        return
+
+    fingerprint = _fingerprint(input_file, f"{input_mode}:{oe}", exe_path)
+    prepared = st.session_state.get("nexus_raw_prepared")
+    if not isinstance(prepared, PreparedNexusTransfer) or prepared.fingerprint != fingerprint:
+        prepared = _prepare_transfer(fingerprint, input_file.name, nexus_df, map_df, exe_path, oe)
+        st.session_state["nexus_raw_prepared"] = prepared
+        st.session_state.pop("nexus_raw_run_result", None)
+
+    st.success("HAS_map.csv, le CSV Nexus et le batch ont été générés.")
+    _render_prepared_downloads(prepared)
+
+    st.subheader("Lancer le transfert")
+    credential_cols = st.columns(2)
+    username = credential_cols[0].text_input("Utilisateur Nexus", key="nexus_raw_username")
+    password = credential_cols[1].text_input("Mot de passe Nexus", type="password", key="nexus_raw_password")
+    confirm = st.checkbox(
+        "J'ai vérifié les données affichées et je confirme le transfert vers Nexus.",
+        key="nexus_raw_confirm",
+    )
+    run_disabled = not username.strip() or not password or not confirm
+    if st.button("Lancer le batch Nexus", type="primary", disabled=run_disabled, width="stretch", key="nexus_raw_run"):
+        render_blocking_run_warning()
+        with st.spinner("Transfert Nexus en cours..."):
+            result = _run_transfer(prepared, username.strip(), password)
+        st.session_state["nexus_raw_run_result"] = result
+
+    result = st.session_state.get("nexus_raw_run_result")
+    if result:
+        if result["Statut"] == "Réussi":
+            st.success(f"Transfert terminé avec le code retour {result['Code retour']}.")
+        else:
+            st.error(f"Transfert terminé avec le statut {result['Statut']} et le code retour {result['Code retour']}.")
+        st.dataframe(pd.DataFrame([{key: value for key, value in result.items() if key != "Log"}]), width="stretch", hide_index=True)
+        st.subheader("Log du transfert")
+        st.code(result["Log"], language="text")
+        render_download_for_path(prepared.log_path, "Télécharger le log", key="nexus_raw_log_download")

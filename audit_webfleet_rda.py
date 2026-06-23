@@ -237,10 +237,648 @@ def audit_safe_filename(x):
     return s[:180] if s else "collaborateur"
 
 
+def audit_join_ids(values):
+    ids = []
+    seen = set()
+    for value in values:
+        raw = "" if pd.isna(value) else str(value)
+        for part in re.split(r"[/,;]+", raw):
+            v = audit_to_int_str(part)
+            if not v or str(v).strip().lower() in {"nan", "nat", "none", "<na>", "-"}:
+                continue
+            v = str(v).strip()
+            if v not in seen:
+                seen.add(v)
+                ids.append(v)
+    return "/".join(ids)
+
+
+def audit_first_text(values):
+    for value in values:
+        v = audit_clean_legend_text(value)
+        if v:
+            return v
+    return ""
+
+
 def audit_duration_mins(a, b):
     if pd.isna(a) or pd.isna(b):
         return np.nan
     return (pd.Timestamp(b) - pd.Timestamp(a)).total_seconds() / 60.0
+
+
+def audit_recalculate_rda_duration(row):
+    if pd.isna(row.get("start", pd.NaT)) or pd.isna(row.get("end", pd.NaT)):
+        return row.get("duree_min", np.nan)
+    duration = audit_duration_mins(row["start"], row["end"])
+    return duration if pd.notna(duration) and duration >= 0 else row.get("duree_min", np.nan)
+
+
+def audit_cut_start_after_wf_end(ts, buffer_min: int = 1):
+    if pd.isna(ts):
+        return pd.NaT
+    ts = pd.Timestamp(ts) + pd.Timedelta(minutes=buffer_min)
+    return ts.ceil("min")
+
+
+def audit_cut_end_before_wf_start(ts, buffer_min: int = 1):
+    if pd.isna(ts):
+        return pd.NaT
+    ts = pd.Timestamp(ts) - pd.Timedelta(minutes=buffer_min)
+    return ts.floor("min")
+
+
+def audit_cut_local_naive_minute(ts):
+    ts = audit_to_local_naive(ts)
+    if pd.isna(ts):
+        return pd.NaT
+    return pd.Timestamp(ts).floor("min")
+
+
+def audit_cut_format_time_like(original_value, ts):
+    ts = audit_cut_local_naive_minute(ts)
+    if pd.isna(ts):
+        return original_value
+    if isinstance(original_value, str):
+        text = original_value.strip()
+        if re.fullmatch(r"\d{1,2}:\d{2}(?::\d{2})?", text):
+            return ts.strftime("%H:%M")
+        if re.search(r"\d{1,2}[./-]\d{1,2}[./-]\d{2,4}", text):
+            return ts.strftime("%d.%m.%Y %H:%M")
+        return ts.strftime("%H:%M")
+    if isinstance(original_value, dtime):
+        return ts.time().replace(second=0, microsecond=0)
+    if isinstance(original_value, (datetime, pd.Timestamp, np.datetime64)):
+        return ts
+    return ts.strftime("%H:%M")
+
+
+def audit_cut_format_duration_like(original_value, minutes):
+    if pd.isna(minutes):
+        return original_value
+    minutes = float(minutes)
+    if isinstance(original_value, str):
+        text = original_value.strip()
+        if re.fullmatch(r"\d{1,2}:\d{2}(?::\d{2})?", text):
+            total_min = int(round(minutes))
+            return f"{total_min // 60}:{total_min % 60:02d}"
+        return str(int(round(minutes))) if abs(minutes - round(minutes)) < 0.001 else f"{minutes:.2f}"
+    if pd.isna(original_value):
+        return round(minutes, 2)
+    try:
+        original_num = float(original_value)
+        if abs(original_num - round(original_num)) < 0.001:
+            return int(round(minutes))
+    except Exception:
+        pass
+    return round(minutes, 2)
+
+
+def audit_append_unique_column(df, base_name, values):
+    col = base_name
+    idx = 2
+    while col in df.columns:
+        col = f"{base_name}_{idx}"
+        idx += 1
+    df[col] = values
+    return col
+
+
+def audit_truthy_flag(value) -> bool:
+    if pd.isna(value):
+        return False
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "y"}
+    return bool(value)
+
+
+def audit_build_rda_cut_input_export(result: dict, rda_cut: pd.DataFrame) -> pd.DataFrame:
+    source = result.get("rda_source_df")
+    rda_cols = result.get("rda_cols", {})
+    if source is None or source.empty:
+        return rda_cut.copy()
+
+    out = source.copy()
+    if "rda_row_id" not in rda_cut.columns:
+        return out
+
+    by_id = rda_cut.set_index("rda_row_id", drop=False)
+    removed_ids = set(
+        pd.to_numeric(
+            rda_cut.loc[rda_cut["rda_cut_removed"].apply(audit_truthy_flag), "rda_row_id"],
+            errors="coerce",
+        ).dropna().astype(int).tolist()
+    ) if "rda_cut_removed" in rda_cut.columns else set()
+    start_col = rda_cols.get("debut")
+    end_col = rda_cols.get("fin")
+    duration_col = rda_cols.get("duree")
+
+    before_start = []
+    after_start = []
+    before_end = []
+    after_end = []
+    minutes_removed = []
+    actions = []
+
+    for row_pos in range(len(out)):
+        cut_row = by_id.loc[row_pos] if row_pos in by_id.index else None
+        action = "" if cut_row is None else str(cut_row.get("rda_cut_action", "") or "")
+        actions.append(action)
+
+        old_start = pd.NaT if cut_row is None else cut_row.get("start", pd.NaT)
+        new_start = pd.NaT if cut_row is None else cut_row.get("cut_start", pd.NaT)
+        old_end = pd.NaT if cut_row is None else cut_row.get("end", pd.NaT)
+        new_end = pd.NaT if cut_row is None else cut_row.get("cut_end", pd.NaT)
+        removed = np.nan if cut_row is None else cut_row.get("cut_minutes_removed", np.nan)
+
+        before_start.append(audit_fmt_hhmm(old_start))
+        after_start.append(audit_fmt_hhmm(new_start))
+        before_end.append(audit_fmt_hhmm(old_end))
+        after_end.append(audit_fmt_hhmm(new_end))
+        minutes_removed.append(removed)
+
+        if not action:
+            continue
+        if start_col in out.columns and pd.notna(new_start):
+            out.at[row_pos, start_col] = audit_cut_format_time_like(out.at[row_pos, start_col], new_start)
+        if end_col in out.columns and pd.notna(new_end):
+            out.at[row_pos, end_col] = audit_cut_format_time_like(out.at[row_pos, end_col], new_end)
+        if duration_col in out.columns and pd.notna(cut_row.get("cut_duree_min", np.nan)):
+            out.at[row_pos, duration_col] = audit_cut_format_duration_like(out.at[row_pos, duration_col], cut_row.get("cut_duree_min"))
+
+    audit_append_unique_column(out, "RDA_cut_action", actions)
+    audit_append_unique_column(out, "Before_cut_start", before_start)
+    audit_append_unique_column(out, "After_cut_start", after_start)
+    audit_append_unique_column(out, "Before_cut_end", before_end)
+    audit_append_unique_column(out, "After_cut_end", after_end)
+    audit_append_unique_column(out, "Cut_minutes_removed", minutes_removed)
+    if removed_ids:
+        out = out.drop(index=[idx for idx in out.index if int(idx) in removed_ids], errors="ignore").reset_index(drop=True)
+    return out
+
+
+def audit_run_rda_cutting(result: dict, chain_gap_min: int = 15, tail_window_min: int = 180, after_end_anchor_min: int = 30) -> dict:
+    rda = result["rda"].copy()
+    wf = result["wf"].copy()
+    map_df = result.get("map_df", pd.DataFrame()).copy()
+
+    if rda.empty or wf.empty:
+        return {
+            "rda_cut": rda,
+            "cut_summary": pd.DataFrame(),
+            "wf_trips_used": pd.DataFrame(),
+            "excel_bytes": None,
+            "excel_path": None,
+            "metrics": {"days_changed": 0, "rows_changed": 0, "minutes_removed": 0.0},
+        }
+
+    for df_obj in [rda, wf]:
+        for col in ["start", "end"]:
+            if col in df_obj.columns:
+                df_obj[col] = audit_align_to_zurich(df_obj[col])
+    rda["collab_id"] = rda["collab_id"].astype(str)
+    wf["collab_id"] = wf["collab_id"].astype(str)
+    rda["cut_start"] = rda["start"]
+    rda["cut_end"] = rda["end"]
+    rda["cut_duree_min"] = rda.apply(audit_recalculate_rda_duration, axis=1)
+    rda["rda_cut_action"] = ""
+    rda["rda_cut_removed"] = False
+    rda["rda_cut_removed_reason"] = ""
+
+    wf_valid = wf.dropna(subset=["collab_id", "start", "end"]).copy()
+    wf_valid = wf_valid[wf_valid["end"] > wf_valid["start"]].copy()
+    if "date" not in wf_valid.columns:
+        wf_valid["date"] = wf_valid["start"].dt.date
+    wf_groups = {
+        (str(cid), day): grp.sort_values(["start", "end"]).reset_index(drop=True)
+        for (cid, day), grp in wf_valid.groupby(["collab_id", "date"], dropna=False)
+    }
+
+    cut_rows = []
+    wf_used_rows = []
+
+    def _wf_trip_label(row):
+        return {
+            "tripid": str(row.get("tripid", "")),
+            "tripmode": row.get("tripmode", np.nan),
+            "wf_start": row.get("start", pd.NaT),
+            "wf_end": row.get("end", pd.NaT),
+            "wf_km": row.get("km", np.nan),
+        }
+
+    def _initial_drive_chain(trips, first_start, first_end):
+        cand = trips[(trips["end"] > first_start) & (trips["start"] < first_end)].copy()
+        if cand.empty:
+            return cand
+        cand = cand.sort_values(["start", "end"]).reset_index(drop=True)
+        chain_idxs = []
+        current_end = None
+        for idx, rr in cand.iterrows():
+            if not chain_idxs:
+                if rr["start"] <= first_start or rr["start"] <= first_start + pd.Timedelta(minutes=chain_gap_min):
+                    chain_idxs.append(idx)
+                    current_end = rr["end"]
+                    if current_end > first_start:
+                        break
+                continue
+            gap = (rr["start"] - current_end).total_seconds() / 60.0
+            if gap <= chain_gap_min:
+                chain_idxs.append(idx)
+                current_end = max(current_end, rr["end"])
+            else:
+                break
+        return cand.loc[chain_idxs].copy() if chain_idxs else cand.iloc[0:0].copy()
+
+    def _final_drive_chain(trips, last_start, last_end):
+        anchor_limit = last_end + pd.Timedelta(minutes=after_end_anchor_min)
+        cand = trips[(trips["end"] > last_start) & (trips["start"] <= anchor_limit)].copy()
+        if cand.empty:
+            return cand
+        tail_anchor = (cand["end"] >= last_end) | ((cand["start"] >= last_end) & (cand["start"] <= anchor_limit))
+        if not tail_anchor.any():
+            return cand.iloc[0:0].copy()
+        cand = cand.loc[:tail_anchor[tail_anchor].index.max()].copy()
+        cand = cand.sort_values(["start", "end"]).reset_index(drop=True)
+        tail_anchor = (cand["end"] >= last_end) | ((cand["start"] >= last_end) & (cand["start"] <= anchor_limit))
+        latest_idx = cand.loc[tail_anchor, "start"].idxmax()
+        chain = [latest_idx]
+        current_start = cand.loc[latest_idx, "start"]
+        for idx in list(cand.index[cand.index < latest_idx])[::-1]:
+            rr = cand.loc[idx]
+            gap = (current_start - rr["end"]).total_seconds() / 60.0
+            if gap <= chain_gap_min:
+                chain.append(idx)
+                current_start = min(current_start, rr["start"])
+            else:
+                break
+        return cand.loc[sorted(chain)].copy()
+
+    valid_rda = rda.dropna(subset=["collab_id", "jour", "start", "end"]).copy()
+    valid_rda = valid_rda[valid_rda["end"] > valid_rda["start"]].copy()
+
+    for (cid, day), grp in valid_rda.groupby(["collab_id", "jour"], dropna=False):
+        grp = grp.sort_values(["start", "end", "rda_row_id"]).copy()
+        trips = wf_groups.get((str(cid), day), pd.DataFrame())
+        if trips.empty:
+            continue
+
+        first_idx = grp.index[0]
+        last_idx = grp.index[-1]
+        original_first_start = rda.at[first_idx, "cut_start"]
+        original_first_end = rda.at[first_idx, "cut_end"]
+        original_last_start = rda.at[last_idx, "cut_start"]
+        original_last_end = rda.at[last_idx, "cut_end"]
+        day_actions = []
+
+        start_chain = _initial_drive_chain(trips, original_first_start, original_first_end)
+        if not start_chain.empty:
+            proposed_start = audit_cut_start_after_wf_end(start_chain["end"].max())
+            if pd.notna(proposed_start) and proposed_start > original_first_start:
+                affected_start_idxs = [
+                    idx for idx, row in grp.iterrows()
+                    if pd.notna(rda.at[idx, "cut_start"]) and pd.notna(rda.at[idx, "cut_end"])
+                    and rda.at[idx, "cut_start"] < proposed_start
+                ]
+                for idx in affected_start_idxs:
+                    old_s = rda.at[idx, "cut_start"]
+                    old_e = rda.at[idx, "cut_end"]
+                    before_min = audit_duration_mins(old_s, old_e)
+                    if pd.isna(before_min) or before_min <= 0:
+                        continue
+                    if old_e <= proposed_start:
+                        rda.at[idx, "cut_start"] = old_s
+                        rda.at[idx, "cut_end"] = old_e
+                        rda.at[idx, "rda_cut_removed"] = True
+                        cut_type = "START_REMOVED"
+                    elif old_s < proposed_start < old_e:
+                        rda.at[idx, "cut_start"] = proposed_start
+                        cut_type = "START_CUT"
+                    else:
+                        continue
+                    after_min = 0.0 if bool(rda.at[idx, "rda_cut_removed"]) else audit_duration_mins(rda.at[idx, "cut_start"], rda.at[idx, "cut_end"])
+                    removed = max(0.0, before_min - after_min) if pd.notna(after_min) else np.nan
+                    if pd.notna(removed) and removed <= 0:
+                        continue
+                    day_actions.append(cut_type)
+                    is_removed = bool(rda.at[idx, "rda_cut_removed"])
+                    cut_rows.append({
+                        "collab_id": str(cid), "date": day, "rda_row_id": int(rda.at[idx, "rda_row_id"]),
+                        "cut_type": cut_type, "old_start": old_s, "new_start": pd.NaT if is_removed else rda.at[idx, "cut_start"],
+                        "old_end": old_e, "new_end": pd.NaT if is_removed else rda.at[idx, "cut_end"],
+                        "minutes_removed": removed, "wf_trip_count": len(start_chain),
+                    })
+                    for _, wr in start_chain.iterrows():
+                        wf_used_rows.append({"collab_id": str(cid), "date": day, "cut_type": cut_type, **_wf_trip_label(wr)})
+
+        last_start_after_start_cut = rda.at[last_idx, "cut_start"]
+        end_chain = _final_drive_chain(trips, original_last_start, original_last_end)
+        if not end_chain.empty:
+            proposed_end = audit_cut_end_before_wf_start(end_chain["start"].min())
+            if pd.notna(proposed_end) and proposed_end < original_last_end:
+                affected_end_idxs = [
+                    idx for idx, row in grp.iterrows()
+                    if pd.notna(rda.at[idx, "cut_start"]) and pd.notna(rda.at[idx, "cut_end"])
+                    and rda.at[idx, "cut_end"] > proposed_end
+                ]
+                for idx in affected_end_idxs:
+                    old_s = rda.at[idx, "cut_start"]
+                    old_e = rda.at[idx, "cut_end"]
+                    before_min = audit_duration_mins(old_s, old_e)
+                    if pd.isna(before_min) or before_min <= 0:
+                        continue
+                    if old_s >= proposed_end:
+                        rda.at[idx, "cut_start"] = old_s
+                        rda.at[idx, "cut_end"] = old_e
+                        rda.at[idx, "rda_cut_removed"] = True
+                        cut_type = "END_REMOVED"
+                    elif old_s < proposed_end < old_e:
+                        rda.at[idx, "cut_end"] = proposed_end
+                        cut_type = "END_CUT"
+                    else:
+                        continue
+                    after_min = 0.0 if bool(rda.at[idx, "rda_cut_removed"]) else audit_duration_mins(rda.at[idx, "cut_start"], rda.at[idx, "cut_end"])
+                    removed = max(0.0, before_min - after_min) if pd.notna(after_min) else np.nan
+                    if pd.notna(removed) and removed <= 0:
+                        continue
+                    day_actions.append(cut_type)
+                    is_removed = bool(rda.at[idx, "rda_cut_removed"])
+                    cut_rows.append({
+                        "collab_id": str(cid), "date": day, "rda_row_id": int(rda.at[idx, "rda_row_id"]),
+                        "cut_type": cut_type, "old_start": old_s, "new_start": pd.NaT if is_removed else rda.at[idx, "cut_start"],
+                        "old_end": old_e, "new_end": pd.NaT if is_removed else rda.at[idx, "cut_end"],
+                        "minutes_removed": removed, "wf_trip_count": len(end_chain),
+                    })
+                    for _, wr in end_chain.iterrows():
+                        wf_used_rows.append({"collab_id": str(cid), "date": day, "cut_type": cut_type, **_wf_trip_label(wr)})
+
+        if day_actions:
+            changed_ids = {int(row["rda_row_id"]) for row in cut_rows if str(row["collab_id"]) == str(cid) and row["date"] == day}
+            changed_idxs = set(rda[rda["rda_row_id"].isin(changed_ids)].index.tolist())
+            for idx in changed_idxs:
+                actions = set(filter(None, str(rda.at[idx, "rda_cut_action"]).split(",")))
+                row_actions = {
+                    str(row["cut_type"])
+                    for row in cut_rows
+                    if str(row["collab_id"]) == str(cid) and row["date"] == day and int(row["rda_row_id"]) == int(rda.at[idx, "rda_row_id"])
+                }
+                actions.update(row_actions)
+                rda.at[idx, "rda_cut_action"] = ",".join(sorted(actions))
+
+    for (cid, day), grp in rda.dropna(subset=["collab_id", "jour", "start", "end"]).groupby(["collab_id", "jour"], dropna=False):
+        grp = grp.sort_values(["cut_start", "cut_end", "rda_row_id"]).copy()
+        grp_active = grp[~grp["rda_cut_removed"].apply(audit_truthy_flag)].copy()
+        if grp_active.empty:
+            continue
+        for boundary, idx in [("START", grp_active.index[0]), ("END", grp_active.index[-1])]:
+            code = str(rda.at[idx, "prestation_code"]).strip() if pd.notna(rda.at[idx, "prestation_code"]) else ""
+            if code != str(AUDIT_PRESTATION_61010_CODE):
+                continue
+            existing_action = str(rda.at[idx, "rda_cut_action"] or "")
+            day_had_start_removal = grp["rda_cut_action"].fillna("").astype(str).str.contains("START_REMOVED").any()
+            day_had_end_removal = grp["rda_cut_action"].fillna("").astype(str).str.contains("END_REMOVED").any()
+            if boundary == "START" and not (day_had_start_removal or "START_CUT" in existing_action):
+                continue
+            if boundary == "END" and not (day_had_end_removal or "END_CUT" in existing_action):
+                continue
+
+            old_s = rda.at[idx, "cut_start"]
+            old_e = rda.at[idx, "cut_end"]
+            removed = audit_duration_mins(old_s, old_e)
+            if pd.isna(removed) or removed <= 0:
+                continue
+            cut_type = f"{boundary}_61010_REMOVED"
+            rda.at[idx, "rda_cut_removed"] = True
+            rda.at[idx, "rda_cut_removed_reason"] = "boundary_61010_after_cut"
+            actions = set(filter(None, existing_action.split(",")))
+            actions.add(cut_type)
+            rda.at[idx, "rda_cut_action"] = ",".join(sorted(actions))
+            cut_rows.append({
+                "collab_id": str(cid), "date": day, "rda_row_id": int(rda.at[idx, "rda_row_id"]),
+                "cut_type": cut_type, "old_start": old_s, "new_start": pd.NaT,
+                "old_end": old_e, "new_end": pd.NaT,
+                "minutes_removed": removed, "wf_trip_count": 0,
+            })
+
+    rda["cut_duree_min"] = [
+        0.0 if audit_truthy_flag(removed) else (audit_duration_mins(s, e) if pd.notna(s) and pd.notna(e) and e > s else np.nan)
+        for s, e, removed in zip(rda["cut_start"], rda["cut_end"], rda["rda_cut_removed"])
+    ]
+    rda["cut_minutes_removed"] = (
+        pd.to_numeric(rda.get("duree_min", np.nan), errors="coerce")
+        - pd.to_numeric(rda["cut_duree_min"], errors="coerce")
+    ).clip(lower=0)
+    rda_input_export = audit_build_rda_cut_input_export(result, rda)
+
+    cut_summary = pd.DataFrame(cut_rows)
+    wf_trips_used = pd.DataFrame(wf_used_rows)
+    if not cut_summary.empty and not map_df.empty and "collab_id" in map_df.columns:
+        name_cols = [c for c in ["collab_id", "collab_name_sarl", "collab_no_sarl", "collab_name_wf", "driverno"] if c in map_df.columns]
+        names = map_df[name_cols].drop_duplicates().copy()
+        names["collab_id"] = names["collab_id"].astype(str)
+        cut_summary = cut_summary.merge(names, how="left", on="collab_id")
+
+    output_dir = get_session_output_root(AUDIT_OUTPUT_FOLDER)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    input_name = str(result.get("rda_input_name", "") or "")
+    input_suffix = Path(input_name).suffix.lower()
+    excel_path = output_dir / f"rda_cutting_{timestamp}.xlsx"
+    excel_bytes = BytesIO()
+    if input_suffix == ".csv":
+        csv_text = rda_input_export.to_csv(index=False)
+        excel_bytes = BytesIO(csv_text.encode("utf-8-sig"))
+        excel_path = output_dir / f"rda_cutting_{timestamp}.csv"
+        with open(excel_path, "wb") as f:
+            f.write(excel_bytes.getvalue())
+        output_mime = "text/csv"
+        download_name = f"{Path(input_name).stem or 'RDA'}_cut.csv"
+    else:
+        with pd.ExcelWriter(excel_bytes, engine="openpyxl") as xw:
+            audit_drop_tz_excel_safe(rda_input_export).to_excel(xw, index=False, sheet_name="RDA_Cut_Input_Format")
+            audit_drop_tz_excel_safe(cut_summary).to_excel(xw, index=False, sheet_name="Cut_Summary")
+            audit_drop_tz_excel_safe(wf_trips_used).to_excel(xw, index=False, sheet_name="WF_Trips_Used")
+            audit_drop_tz_excel_safe(rda).to_excel(xw, index=False, sheet_name="RDA_Cut_Normalized")
+        excel_bytes.seek(0)
+        with open(excel_path, "wb") as f:
+            f.write(excel_bytes.getvalue())
+        output_mime = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        download_name = f"{Path(input_name).stem or 'RDA'}_cut.xlsx"
+    excel_bytes.seek(0)
+
+    return {
+        "rda_cut": rda,
+        "rda_input_export": rda_input_export,
+        "cut_summary": cut_summary,
+        "wf_trips_used": wf_trips_used,
+        "excel_bytes": excel_bytes,
+        "excel_path": excel_path,
+        "output_mime": output_mime,
+        "download_name": download_name,
+        "metrics": {
+            "days_changed": int(cut_summary[["collab_id", "date"]].drop_duplicates().shape[0]) if not cut_summary.empty else 0,
+            "rows_changed": int(rda["rda_cut_action"].fillna("").astype(str).str.len().gt(0).sum()),
+            "minutes_removed": float(cut_summary["minutes_removed"].fillna(0).sum()) if not cut_summary.empty else 0.0,
+        },
+    }
+
+
+def audit_build_cut_chart_result(result: dict, cutting: dict) -> dict:
+    cut_result = dict(result)
+    rda_cut = cutting.get("rda_cut", pd.DataFrame()).copy()
+    if not rda_cut.empty:
+        rda_cut["original_start"] = rda_cut.get("start", pd.NaT)
+        rda_cut["original_end"] = rda_cut.get("end", pd.NaT)
+        rda_cut["start"] = rda_cut.get("cut_start", rda_cut.get("start", pd.NaT))
+        rda_cut["end"] = rda_cut.get("cut_end", rda_cut.get("end", pd.NaT))
+        rda_cut["duree_min"] = rda_cut.get("cut_duree_min", rda_cut.get("duree_min", np.nan))
+    cut_result["rda"] = rda_cut
+    cut_result["rda_chart_mode"] = "cut"
+    return cut_result
+
+
+def audit_generate_cut_pdfs(result: dict, cutting: dict, progress_cb=None):
+    cut_result = audit_build_cut_chart_result(result, cutting)
+    return audit_generate_pdfs(cut_result, progress_cb=progress_cb)
+
+
+def audit_build_manual_review_worklist(result: dict, cutting: dict) -> pd.DataFrame:
+    cut_summary = cutting.get("cut_summary", pd.DataFrame()).copy()
+    rda_cut = cutting.get("rda_cut", pd.DataFrame()).copy()
+    if cut_summary.empty:
+        return pd.DataFrame()
+
+    if not rda_cut.empty and "rda_row_id" in rda_cut.columns:
+        detail_cols = [
+            c for c in [
+                "rda_row_id", "collab_id", "collab_name", "collab_no_sarl", "jour",
+                "client_nr", "client_name", "prestation_code", "prestation_text",
+                "duree_min", "cut_duree_min", "cut_minutes_removed",
+                "rda_cut_action", "rda_cut_removed",
+            ] if c in rda_cut.columns
+        ]
+        detail_cols = [
+            c for c in detail_cols
+            if c in {"rda_row_id", "collab_id"} or c not in cut_summary.columns
+        ]
+        details = rda_cut[detail_cols].drop_duplicates("rda_row_id").copy()
+        work = cut_summary.merge(details, how="left", on=["rda_row_id", "collab_id"])
+    else:
+        work = cut_summary.copy()
+
+    source = result.get("rda_source_df")
+    rda_cols = result.get("rda_cols", {})
+    if source is not None and not source.empty and "rda_row_id" in work.columns:
+        source_rows = source.copy()
+        source_rows["rda_row_id"] = source_rows.index.astype(int)
+        keep_source_cols = [
+            c for c in [
+                rda_cols.get("jour"), rda_cols.get("debut"), rda_cols.get("fin"),
+                rda_cols.get("duree"), rda_cols.get("collab_name"),
+                rda_cols.get("collab_no"), rda_cols.get("client_nr"),
+                rda_cols.get("client_name"), rda_cols.get("prestation_name"),
+            ] if c and c in source_rows.columns
+        ]
+        source_rows = source_rows[["rda_row_id"] + keep_source_cols].copy()
+        source_rows = source_rows.rename(columns={c: f"source_{c}" for c in keep_source_cols})
+        work = work.merge(source_rows, how="left", on="rda_row_id")
+
+    def _manual_action(row):
+        cut_type = audit_clean_legend_text(row.get("cut_type", ""))
+        removed = audit_truthy_flag(row.get("rda_cut_removed", False)) or cut_type.endswith("_REMOVED")
+        if removed:
+            return "SUPPRIMER_OU_METTRE_A_ZERO"
+        if cut_type.startswith("START"):
+            return "MODIFIER_DEBUT"
+        if cut_type.startswith("END"):
+            return "MODIFIER_FIN"
+        return "VERIFIER"
+
+    work["manual_action"] = work.apply(_manual_action, axis=1)
+    work["rda_excel_row"] = pd.to_numeric(work.get("rda_row_id", np.nan), errors="coerce") + 2
+    work["current_start"] = work.get("old_start", pd.NaT)
+    work["current_end"] = work.get("old_end", pd.NaT)
+    work["suggested_start"] = work.get("new_start", pd.NaT)
+    work["suggested_end"] = work.get("new_end", pd.NaT)
+    work["suggested_duration_min"] = pd.to_numeric(work.get("cut_duree_min", np.nan), errors="coerce")
+    removed_mask = work["manual_action"].eq("SUPPRIMER_OU_METTRE_A_ZERO")
+    work.loc[removed_mask, "suggested_duration_min"] = 0.0
+    work["manual_check_note"] = np.where(
+        removed_mask,
+        "Le trajet Webfleet couvre cette prestation RDA: verifier puis supprimer la ligne ou mettre la duree a 0.",
+        "Verifier dans le PDF rouge, puis remplacer uniquement l'heure indiquee et recalculer la duree.",
+    )
+
+    ordered = [
+        "collab_id", "collab_name_sarl", "collab_name", "collab_no_sarl", "date",
+        "rda_excel_row", "rda_row_id", "manual_action", "cut_type",
+        "current_start", "suggested_start", "current_end", "suggested_end",
+        "duree_min", "suggested_duration_min", "minutes_removed",
+        "client_nr", "client_name", "prestation_code", "prestation_text",
+        "wf_trip_count", "tripid", "tripmode", "wf_start", "wf_end", "wf_km",
+        "manual_check_note",
+    ]
+    ordered += [c for c in work.columns if c.startswith("source_")]
+    ordered = [c for c in ordered if c in work.columns]
+    return work[ordered + [c for c in work.columns if c not in ordered]].sort_values(
+        [c for c in ["collab_id", "date", "rda_excel_row", "cut_type"] if c in work.columns]
+    ).reset_index(drop=True)
+
+
+def audit_build_manual_review_export(result: dict, cutting: dict) -> dict:
+    worklist = audit_build_manual_review_worklist(result, cutting)
+    rda_input_export = cutting.get("rda_input_export", pd.DataFrame())
+    output_dir = get_session_output_root(AUDIT_OUTPUT_FOLDER)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    excel_path = output_dir / f"rda_manual_review_{timestamp}.xlsx"
+    excel_bytes = BytesIO()
+    with pd.ExcelWriter(excel_bytes, engine="openpyxl") as xw:
+        audit_drop_tz_excel_safe(worklist).to_excel(xw, index=False, sheet_name="Manual_Changes")
+        audit_drop_tz_excel_safe(rda_input_export).to_excel(xw, index=False, sheet_name="Modified_RDA_Input_Format")
+        audit_drop_tz_excel_safe(cutting.get("cut_summary", pd.DataFrame())).to_excel(xw, index=False, sheet_name="Detection_Details")
+        audit_drop_tz_excel_safe(cutting.get("wf_trips_used", pd.DataFrame())).to_excel(xw, index=False, sheet_name="WF_Trips_Used")
+    excel_bytes.seek(0)
+    with open(excel_path, "wb") as f:
+        f.write(excel_bytes.getvalue())
+    excel_bytes.seek(0)
+    return {
+        "worklist": worklist,
+        "rda_input_export": rda_input_export,
+        "excel_bytes": excel_bytes,
+        "excel_path": excel_path,
+        "download_name": "rda_manual_changes_to_review.xlsx",
+        "output_mime": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    }
+
+
+def audit_run_rda_manual_review(result: dict) -> dict:
+    cutting = audit_run_rda_cutting(result)
+    manual_export = audit_build_manual_review_export(result, cutting)
+    return {**cutting, **manual_export}
+
+
+def audit_build_manual_review_chart_result(result: dict, manual_review: dict) -> dict:
+    manual_result = dict(result)
+    rda = result.get("rda", pd.DataFrame()).copy()
+    rda_cut = manual_review.get("rda_cut", pd.DataFrame()).copy()
+    if not rda.empty and not rda_cut.empty and "rda_row_id" in rda.columns and "rda_row_id" in rda_cut.columns:
+        annotation_cols = [
+            c for c in [
+                "rda_row_id", "cut_start", "cut_end", "cut_duree_min",
+                "rda_cut_action", "rda_cut_removed", "rda_cut_removed_reason",
+                "cut_minutes_removed",
+            ] if c in rda_cut.columns
+        ]
+        annotations = rda_cut[annotation_cols].drop_duplicates("rda_row_id").copy()
+        rda = rda.merge(annotations, how="left", on="rda_row_id")
+        rda["rda_cut_action"] = rda["rda_cut_action"].fillna("")
+    manual_result["rda"] = rda
+    manual_result["rda_chart_mode"] = "manual_review"
+    return manual_result
+
+
+def audit_generate_manual_review_pdfs(result: dict, manual_review: dict, progress_cb=None):
+    manual_result = audit_build_manual_review_chart_result(result, manual_review)
+    return audit_generate_pdfs(manual_result, progress_cb=progress_cb)
 
 
 # ============================================================
@@ -556,6 +1194,7 @@ def audit_process(rda_file, wf_file, mapping_file, planning_file, progress_cb=No
             prefer_code=AUDIT_PRESTATION_61010_CODE if AUDIT_ENABLE_61010_FEATURE else None
         )
         RDA = _strip_bom(RDA)
+    RDA_SOURCE = RDA.copy()
 
     if wf_name.lower().endswith(".csv"):
         WF = _strip_bom(read_csv_flex(BytesIO(wf_bytes)))
@@ -657,18 +1296,52 @@ def audit_process(rda_file, wf_file, mapping_file, planning_file, progress_cb=No
     map_name_wf_col = rda_pick_col(MAP, ["collaborateur-webfleet", "collab_webfleet", "Driver Name", "name-collaborateur"])
     map_drv_main_col = rda_pick_col(MAP, ["no-collaborateur-wf", "no-collaborateur-webfleet", "driverno", "Driver No"])
 
-    map_df = pd.DataFrame({
+    RDA_ID_CANDIDATES = [
+        "no-collaborateur-sarl-102", "no-collaborateur-sa-101", "no-collaborateur-ne-103",
+        "No collaborateur", "No Collaborateur", "collab_no_sarl",
+    ]
+    UO_ID_CANDIDATES = [
+        "no-collaborateur-wf", "no-collaborateur-webfleet", "no-collaborateur-sa-101",
+        "no-collaborateur-sarl-102", "no-collaborateur-ne-103",
+        "collab_no_webfleet", "UO ID", "UO ID 2", "UO ID 3", "driverno", "Driver No",
+    ]
+    PLAN_EMP_ID_CANDIDATES = list(dict.fromkeys(RDA_ID_CANDIDATES + UO_ID_CANDIDATES + [collab_id_col, "emp_nr", "employee_nr", "Employee No"]))
+    PLAN_DISPLAY_ID_CANDIDATES = ["emp_nr", "employee_nr", "Employee No"]
+
+    def _joined_map_ids(candidates):
+        cols = [c for c in candidates if c in MAP.columns]
+        if not cols:
+            return pd.Series([""] * len(MAP), index=MAP.index, dtype=object)
+        return MAP[cols].apply(lambda row: audit_join_ids(row.tolist()), axis=1)
+
+    map_raw = pd.DataFrame({
         "collab_id": MAP[collab_id_col].astype(str),
         "collab_no_sarl": (MAP[map_no_sarl_col].apply(audit_to_int_str) if map_no_sarl_col else None),
         "collab_name_sarl": (MAP[map_name_sarl_col].astype(str) if map_name_sarl_col else ""),
         "collab_name_wf": (MAP[map_name_wf_col].astype(str) if map_name_wf_col else ""),
         "driverno": (MAP[map_drv_main_col].apply(audit_to_int_str) if map_drv_main_col else None),
-    }).dropna(subset=["collab_id"]).drop_duplicates()
+        "rda_ids": _joined_map_ids(RDA_ID_CANDIDATES),
+        "wf_ids": _joined_map_ids(UO_ID_CANDIDATES),
+        "planning_ids": _joined_map_ids(PLAN_DISPLAY_ID_CANDIDATES),
+    }).dropna(subset=["collab_id"])
 
-    RDA_ID_CANDIDATES = [
-        "no-collaborateur-sarl-102", "no-collaborateur-sa-101", "no-collaborateur-ne-103",
-        "No collaborateur", "No Collaborateur", "collab_no_sarl",
-    ]
+    map_df = pd.DataFrame({
+        "collab_id": [],
+    })
+    if not map_raw.empty:
+        map_df = (
+            map_raw.groupby("collab_id", as_index=False)
+            .agg({
+                "collab_no_sarl": audit_join_ids,
+                "collab_name_sarl": audit_first_text,
+                "collab_name_wf": audit_first_text,
+                "driverno": audit_join_ids,
+                "rda_ids": audit_join_ids,
+                "wf_ids": audit_join_ids,
+                "planning_ids": audit_join_ids,
+            })
+        )
+
     sarlno_to_id = {}
     for col in RDA_ID_CANDIDATES:
         if col in MAP.columns:
@@ -680,11 +1353,6 @@ def audit_process(rda_file, wf_file, mapping_file, planning_file, progress_cb=No
                     sarlno_to_id.setdefault(str(rno), str(cid))
     rda["collab_id"] = rda["collab_no_sarl"].map(sarlno_to_id)
 
-    UO_ID_CANDIDATES = [
-        "no-collaborateur-wf", "no-collaborateur-webfleet", "no-collaborateur-sa-101",
-        "no-collaborateur-sarl-102", "no-collaborateur-ne-103",
-        "collab_no_webfleet", "UO ID", "UO ID 2", "UO ID 3", "driverno", "Driver No",
-    ]
     driverno_to_id = {}
     for col in UO_ID_CANDIDATES:
         if col in MAP.columns:
@@ -718,7 +1386,6 @@ def audit_process(rda_file, wf_file, mapping_file, planning_file, progress_cb=No
 
     planning_emp_nr = PLANNING[plan_cols["emp_nr"]].apply(audit_to_int_str)
 
-    PLAN_EMP_ID_CANDIDATES = list(dict.fromkeys(RDA_ID_CANDIDATES + UO_ID_CANDIDATES + [collab_id_col, "emp_nr", "employee_nr", "Employee No"]))
     plan_emp_to_id = dict(sarlno_to_id)
 
     cols_list = list(MAP.columns)
@@ -1276,6 +1943,9 @@ def audit_process(rda_file, wf_file, mapping_file, planning_file, progress_cb=No
         "flag_summary": flag_summary,
         "prestation61010_checks": prestation61010_checks,
         "prestation61010_day_counts": prestation61010_day_counts,
+        "rda_source_df": RDA_SOURCE,
+        "rda_cols": rda_cols,
+        "rda_input_name": rda_name,
         "excel_path": excel_path,
         "excel_bytes": excel_bytes,
         "metrics": {
@@ -1298,6 +1968,7 @@ def audit_build_chart_data(result: dict):
     rda = result["rda"]
     planning = result["planning"]
     map_df = result["map_df"]
+    rda_chart_mode = result.get("rda_chart_mode", "original")
 
     def _to_ln(ts):
         return audit_to_local_naive(ts, tz_name)
@@ -1353,10 +2024,18 @@ def audit_build_chart_data(result: dict):
             if not row.empty:
                 rr = row.iloc[0]
                 nm = _safe_text(rr.get("collab_name_sarl", "")).strip() or _safe_text(rr.get("collab_name_wf", "")).strip()
-                sa = _safe_text(rr.get("collab_no_sarl", "")).strip() or "-"
-                wf_no = _safe_text(rr.get("driverno", "")).strip() or "-"
+                id_parts = [f"ID: {cid}"]
+                rda_ids = _safe_text(rr.get("rda_ids", "")).strip() or _safe_text(rr.get("collab_no_sarl", "")).strip()
+                wf_ids = _safe_text(rr.get("wf_ids", "")).strip() or _safe_text(rr.get("driverno", "")).strip()
+                planning_ids = _safe_text(rr.get("planning_ids", "")).strip()
+                if rda_ids:
+                    id_parts.append(f"RDA: {rda_ids}")
+                if wf_ids:
+                    id_parts.append(f"WF: {wf_ids}")
+                if planning_ids:
+                    id_parts.append(f"Planning: {planning_ids}")
                 if nm:
-                    label = f"{nm} (ID collab-{cid}, SA:{sa}, WF:{wf_no})"
+                    label = f"{nm} ({', '.join(id_parts)})"
         collab_labels[cid] = label or f"Collaborateur {cid}"
 
     rows_ev = []
@@ -1384,6 +2063,7 @@ def audit_build_chart_data(result: dict):
             "collab_id": cid, "collab_label": collab_labels.get(cid, cid), "date_str": date_str,
             "kind": "WF", "y": LANE_Y["WF"], "left": s, "right": e, "mid": s + (e - s) / 2, "height": 0.34,
             "fill_color": fill_c, "line_color": "#7f0000" if is_suspect else "#202020",
+            "line_width": 1.0,
             "label_text": f"{int(round(audit_duration_mins(s, e)))}m", "label_y": -0.20, "label_color": "#222222",
             "km_label": km_txt, "km_label_y": -0.38 if ((wf_idx - 1) % 2 == 0) else -0.48,
             "km_label_color": "#d62728" if is_suspect else "#111111", "wf_index": wf_idx,
@@ -1407,16 +2087,38 @@ def audit_build_chart_data(result: dict):
         client_nr = audit_clean_legend_text(getattr(rr, "client_nr", ""))
         client_name = audit_clean_legend_text(getattr(rr, "client_name", ""))
         is_61010 = str(code) == str(AUDIT_PRESTATION_61010_CODE)
+        cut_action = audit_clean_legend_text(getattr(rr, "rda_cut_action", ""))
+        is_manual_review = rda_chart_mode == "manual_review"
+        was_cut = bool(cut_action) and rda_chart_mode in {"cut", "manual_review"}
+        cut_removed = getattr(rr, "cut_minutes_removed", np.nan)
+        is_removed = audit_truthy_flag(getattr(rr, "rda_cut_removed", False)) if (was_cut and not is_manual_review) else False
+        base_label = f"{int(round(audit_duration_mins(s, e)))}m"
+        cut_minutes_label = ""
+        if was_cut:
+            action_label = cut_action.replace("_", " ")
+            cut_prefix = "CHECK" if is_manual_review else "CUT"
+            cut_minutes_label = f"{cut_prefix} {int(round(float(cut_removed)))}m" if pd.notna(cut_removed) else cut_prefix
+            base_label = "" if is_removed else base_label
         rows_ev.append({
             "collab_id": cid, "collab_label": collab_labels.get(cid, cid), "date_str": date_str,
             "kind": "RDA_ORIG", "y": LANE_Y["RDA_ORIG"], "left": s, "right": e, "mid": s + (e - s) / 2, "height": 0.34,
-            "fill_color": _cmp_rda_orig_color(code_key), "line_color": "#202020",
-            "label_text": f"{int(round(audit_duration_mins(s, e)))}m", "label_y": 0.80,
-            "label_color": "#b30000" if is_61010 else "#111111",
+            "fill_color": _cmp_rda_orig_color(code_key),
+            "line_color": "#d00000" if was_cut else "#202020",
+            "line_width": 3.6 if is_manual_review and was_cut else 2.8 if was_cut else 1.0,
+            "is_removed": is_removed,
+            "ghost_left": _to_ln(getattr(rr, "original_start", pd.NaT)) if was_cut and not is_manual_review else pd.NaT,
+            "ghost_right": _to_ln(getattr(rr, "original_end", pd.NaT)) if was_cut and not is_manual_review else pd.NaT,
+            "label_text": base_label, "label_y": 0.80,
+            "label_color": "#d00000" if was_cut else ("#b30000" if is_61010 else "#111111"),
             "km_label": "", "km_label_y": np.nan, "km_label_color": "#111111", "wf_index": np.nan,
             "client_nr": client_nr, "client_label": client_name or (f"Client {client_nr}" if client_nr else ""),
             "event_color": "", "event_color_key": "",
             "prestation_code": code_key, "prestation_text": _prestation_desc(code_key, prestation_text),
+            "cut_action": action_label if was_cut else "",
+            "cut_minutes_removed": cut_removed if was_cut else np.nan,
+            "cut_minutes_label": cut_minutes_label,
+            "original_start": _to_ln(getattr(rr, "original_start", pd.NaT)) if was_cut and not is_manual_review else pd.NaT,
+            "original_end": _to_ln(getattr(rr, "original_end", pd.NaT)) if was_cut and not is_manual_review else pd.NaT,
         })
 
     plan_local = planning.dropna(subset=["collab_id", "start", "end"]).copy()
@@ -1441,6 +2143,7 @@ def audit_build_chart_data(result: dict):
             "collab_id": cid, "collab_label": collab_labels.get(cid, cid), "date_str": date_str,
             "kind": "Planning", "y": LANE_Y["Planning"], "left": s, "right": e, "mid": s + (e - s) / 2, "height": 0.34,
             "fill_color": planning_color, "line_color": "#4A3B33",
+            "line_width": 1.0,
             "label_text": f"{int(round(audit_duration_mins(s, e)))}m", "label_y": 1.80, "label_color": "#111111",
             "km_label": "", "km_label_y": np.nan, "km_label_color": "#111111", "wf_index": np.nan,
             "client_nr": client_nr, "client_label": client_label,
@@ -1563,6 +2266,21 @@ def audit_build_day_fig(data_ctx: dict, result: dict, cid: str, date_str: str):
             lines.append(f"{idx_txt}. {s} → {e} ({mins_txt}){km_txt}")
         return "ALL WF TRIPS\n" + "\n".join(lines)
 
+    def _rda_all_text(day_events):
+        sub = day_events[day_events["kind"] == "RDA_ORIG"].sort_values(["left", "right"]).reset_index(drop=True)
+        if sub.empty:
+            return "ALL RDA PRESTATIONS\n-"
+        lines = []
+        for idx, row in sub.iterrows():
+            idx_txt = f"{idx + 1:02d}"
+            s = audit_fmt_hhmm(row["left"])
+            e = audit_fmt_hhmm(row["right"])
+            mins = audit_duration_mins(row["left"], row["right"])
+            mins_txt = f"{int(round(mins))}m" if pd.notna(mins) else "-"
+            code_txt = audit_clean_legend_text(row.get("prestation_code", "")) or "-"
+            lines.append(f"{idx_txt}. {code_txt} | {s} → {e} ({mins_txt})")
+        return "ALL RDA PRESTATIONS\n" + "\n".join(lines)
+
     def _legend_items(day_events):
         client_items = []
         seen_clients = set()
@@ -1665,6 +2383,53 @@ def audit_build_day_fig(data_ctx: dict, result: dict, cid: str, date_str: str):
                 family="monospace", color="#222222", fontweight="bold",
             )
 
+    def _draw_client_index_band(fig, rect, client_items):
+        if not client_items:
+            return
+        rows_total = len(client_items)
+        rows_per_col = 1 if rows_total <= 6 else 2 if rows_total <= 16 else 3
+        cols = int(math.ceil(rows_total / rows_per_col))
+        fs = (7.6 if rows_total <= 10 else 6.9 if rows_total <= 18 else 6.2) * 1.21
+        ax_client = fig.add_axes(rect)
+        ax_client.set_axis_off()
+        ax_client.text(0.0, 1.0, "CLIENTS", transform=ax_client.transAxes,
+                       ha="left", va="top", fontsize=fs + 0.5, fontweight="bold", color="#222222")
+        col_w = 0.98 / max(1, cols)
+        row_h = 0.34 if rows_per_col == 2 else 0.24 if rows_per_col == 3 else 0.58
+        start_y = 0.66
+        for idx, (client_nr, label) in enumerate(client_items):
+            col = idx // rows_per_col
+            row = idx % rows_per_col
+            x = col * col_w
+            y = start_y - row * row_h
+            item_max = max(15, int(22 - max(0, cols - 4) * 2))
+            client_txt = audit_shorten_text(client_nr, 7)
+            if len(client_txt) > 4:
+                client_prefix, client_suffix = client_txt[:-4], client_txt[-4:]
+            else:
+                client_prefix, client_suffix = "", client_txt
+            prefix_pts = len(client_prefix) * fs * 0.55
+            suffix_pts = len(client_suffix) * fs * 0.58
+            if client_prefix:
+                ax_client.annotate(
+                    client_prefix, xy=(x, y), xycoords=ax_client.transAxes,
+                    xytext=(0, 0), textcoords="offset points",
+                    ha="left", va="top", fontsize=fs, family="monospace",
+                    color="#222222", fontweight="normal",
+                )
+            ax_client.annotate(
+                client_suffix, xy=(x, y), xycoords=ax_client.transAxes,
+                xytext=(prefix_pts, 0), textcoords="offset points",
+                ha="left", va="top", fontsize=fs, family="monospace",
+                color="#111111", fontweight="bold",
+            )
+            ax_client.annotate(
+                f" = {audit_shorten_text(label, item_max)}", xy=(x, y), xycoords=ax_client.transAxes,
+                xytext=(prefix_pts + suffix_pts + 3, 0), textcoords="offset points",
+                ha="left", va="top", fontsize=fs, family="monospace",
+                color="#222222", fontweight="normal",
+            )
+
     def _draw_header_indexes(fig, plan_items, prest_items):
         _draw_lane_box(fig, [0.300, 0.785, 0.195, 0.095], "PLANNING COLORS", plan_items, fs=8.2)
         _draw_lane_box(fig, [0.505, 0.785, 0.210, 0.095], "PRESTATION INDEX", prest_items, fs=8.2)
@@ -1693,7 +2458,7 @@ def audit_build_day_fig(data_ctx: dict, result: dict, cid: str, date_str: str):
                         fontsize=fs, color="#222222", linespacing=0.90)
             y -= line_h
 
-    def _draw_right_index(fig, day_events, wf_all_text, wf_fs):
+    def _draw_right_index(fig, day_events, wf_all_text, rda_all_text):
         client_items, planning_color_items, prestation_items = _legend_items(day_events)
 
         plan_items = [(audit_shorten_text(label, 28), color or "#bdbdbd") for label, color in planning_color_items]
@@ -1703,8 +2468,35 @@ def audit_build_day_fig(data_ctx: dict, result: dict, cid: str, date_str: str):
             prest_items.append((audit_shorten_text(label, 28), color or "#2ca02c"))
 
         _draw_header_indexes(fig, plan_items, prest_items)
-        _draw_client_index_box(fig, [0.858, 0.355, 0.137, 0.375], client_items)
-        fig.text(0.858, 0.285, wf_all_text, ha="left", va="top", fontsize=wf_fs,
+        _draw_client_index_band(fig, [0.068, 0.724, 0.785, 0.061], client_items)
+
+        right_top = 0.730
+        right_bottom = 0.105
+        gap = 0.020
+        list_top = right_top
+        available_h = max(0.180, list_top - right_bottom)
+        rda_lines = max(1, rda_all_text.count("\n") + 1)
+        wf_lines = max(1, wf_all_text.count("\n") + 1)
+        total_lines = max(1, rda_lines + wf_lines)
+
+        rda_h = available_h * (rda_lines / total_lines)
+        rda_h = min(max(rda_h, 0.120), available_h - 0.120) if available_h > 0.260 else available_h * 0.48
+        wf_h = max(0.080, available_h - rda_h - gap)
+
+        def _fit_fs(line_count, box_h, max_fs):
+            fig_h_in = max(1.0, float(fig.get_size_inches()[1]))
+            fitted = (box_h * fig_h_in * 72.0) / (line_count * 1.24)
+            return max(4.2, min(max_fs, fitted))
+
+        rda_fs = _fit_fs(rda_lines, rda_h, 8.2)
+        wf_fs = _fit_fs(wf_lines, wf_h, 8.2)
+        rda_y = list_top
+        wf_y = rda_y - rda_h - gap
+
+        fig.text(0.858, rda_y, rda_all_text, ha="left", va="top", fontsize=rda_fs,
+                 family="monospace", color="#222222",
+                 bbox=dict(facecolor="#ffffff", edgecolor="#cfcfcf", boxstyle="round,pad=0.38", alpha=0.96))
+        fig.text(0.858, wf_y, wf_all_text, ha="left", va="top", fontsize=wf_fs,
                  family="monospace", color="#222222",
                  bbox=dict(facecolor="#ffffff", edgecolor="#cfcfcf", boxstyle="round,pad=0.38", alpha=0.96))
 
@@ -1723,6 +2515,10 @@ def audit_build_day_fig(data_ctx: dict, result: dict, cid: str, date_str: str):
 
     def _lane_span(day_events, kind):
         sub = day_events[day_events["kind"] == kind]
+        if kind == "RDA_ORIG" and "is_removed" in sub.columns:
+            active = sub[~sub["is_removed"].apply(audit_truthy_flag)]
+            if not active.empty:
+                sub = active
         if sub.empty:
             return pd.NaT, pd.NaT
         s = _to_ln(sub["left"].min())
@@ -1731,6 +2527,10 @@ def audit_build_day_fig(data_ctx: dict, result: dict, cid: str, date_str: str):
 
     def _draw_markers(ax, day_events):
         sub = day_events[day_events["kind"] == "RDA_ORIG"]
+        if "is_removed" in sub.columns:
+            active = sub[~sub["is_removed"].apply(audit_truthy_flag)]
+            if not active.empty:
+                sub = active
         if sub.empty:
             return
         rs = _to_ln(sub["left"].min())
@@ -1773,16 +2573,31 @@ def audit_build_day_fig(data_ctx: dict, result: dict, cid: str, date_str: str):
         for _, rr in day_events.iterrows():
             left = _to_ln(rr["left"])
             right = _to_ln(rr["right"])
-            if pd.isna(left) or pd.isna(right) or right <= left:
-                continue
             y = float(rr["y"])
             h = float(rr["height"])
-            ax.broken_barh(
-                [(mdates.date2num(left), mdates.date2num(right) - mdates.date2num(left))],
-                (y - h / 2.0, h),
-                facecolors=rr["fill_color"], edgecolors=rr["line_color"], linewidth=1.0, alpha=0.95, zorder=3,
-            )
+            ghost_left = _to_ln(rr.get("ghost_left", pd.NaT))
+            ghost_right = _to_ln(rr.get("ghost_right", pd.NaT))
+            if pd.notna(ghost_left) and pd.notna(ghost_right) and ghost_right > ghost_left:
+                ax.broken_barh(
+                    [(mdates.date2num(ghost_left), mdates.date2num(ghost_right) - mdates.date2num(ghost_left))],
+                    (y - h / 2.0, h),
+                    facecolors="none", edgecolors="#d00000", linewidth=1.5,
+                    linestyle=(0, (4, 3)), alpha=0.35, zorder=2,
+                )
+            is_removed = audit_truthy_flag(rr.get("is_removed", False))
+            if pd.isna(left) or pd.isna(right) or right <= left:
+                if not is_removed:
+                    continue
+            elif not is_removed:
+                ax.broken_barh(
+                    [(mdates.date2num(left), mdates.date2num(right) - mdates.date2num(left))],
+                    (y - h / 2.0, h),
+                    facecolors=rr["fill_color"], edgecolors=rr["line_color"],
+                    linewidth=float(rr.get("line_width", 1.0) or 1.0), alpha=0.95, zorder=3,
+                )
             mid = _to_ln(rr["mid"])
+            if is_removed and pd.notna(ghost_left) and pd.notna(ghost_right):
+                mid = ghost_left + (ghost_right - ghost_left) / 2
             lab = rr["label_text"]
             if pd.notna(mid) and str(lab).strip():
                 ax.text(mdates.date2num(mid), rr["label_y"], lab, ha="center", va="center", fontsize=8.5,
@@ -1792,6 +2607,31 @@ def audit_build_day_fig(data_ctx: dict, result: dict, cid: str, date_str: str):
                 width_min = audit_duration_mins(left, right)
                 if pd.notna(mid) and client_nr and pd.notna(width_min) and width_min >= 5:
                     _draw_client_id_label(mdates.date2num(mid), y, client_nr, str(rr["kind"]))
+            cut_action = audit_clean_legend_text(rr.get("cut_action", ""))
+            if str(rr["kind"]) == "RDA_ORIG" and cut_action:
+                marker_left = ghost_left if is_removed and pd.notna(ghost_left) else left
+                marker_right = ghost_right if is_removed and pd.notna(ghost_right) else right
+                if pd.isna(marker_left) or pd.isna(marker_right):
+                    continue
+                ax.scatter(
+                    [mdates.date2num(marker_left), mdates.date2num(marker_right)], [y + 0.30, y + 0.30],
+                    marker="v", s=70, color="#d00000", edgecolors="#ffffff", linewidths=0.7,
+                    zorder=8, clip_on=False,
+                )
+                if not is_removed:
+                    ax.text(
+                        mdates.date2num(mid), y + 0.42, cut_action, ha="center", va="center",
+                        fontsize=7.4, color="#ffffff", fontweight="bold", zorder=8, clip_on=False,
+                        bbox=dict(facecolor="#d00000", edgecolor="#d00000", alpha=0.95, boxstyle="round,pad=0.20"),
+                    )
+                cut_minutes_label = audit_clean_legend_text(rr.get("cut_minutes_label", ""))
+                if cut_minutes_label:
+                    minutes_y = y + 0.42 if is_removed else y + 0.60
+                    ax.text(
+                        mdates.date2num(mid), minutes_y, cut_minutes_label, ha="center", va="center",
+                        fontsize=8.0, color="#d00000", fontweight="bold", zorder=8, clip_on=False,
+                        bbox=dict(facecolor="#ffffff", edgecolor="none", alpha=0.72, pad=0.12),
+                    )
             if str(rr["kind"]) == "WF":
                 wf_idx = rr.get("wf_index", np.nan)
                 if pd.notna(mid) and pd.notna(wf_idx):
@@ -1824,13 +2664,16 @@ def audit_build_day_fig(data_ctx: dict, result: dict, cid: str, date_str: str):
                f"    |    Professionnel: {km_stats['km_professional']:.1f}km"
                f"    |    Total: {km_stats['km_total']:.1f}km")
     wf_all_text = _wf_all_text(day_events)
-    wf_count = int((day_events["kind"] == "WF").sum())
-    wf_fs = 8.4 if wf_count <= 12 else 7.3 if wf_count <= 25 else 6.4 if wf_count <= 40 else 5.5 if wf_count <= 60 else 4.8
+    rda_all_text = _rda_all_text(day_events)
     prev_rest_text, next_rest_text = _rest_texts(cid, date_str)
     subtitle = (f"Frame: {audit_fmt_hhmm(left_bound)} → {audit_fmt_hhmm(right_bound)}"
                 f"    |    WF span: {audit_fmt_span(wf_s, wf_e)}"
                 f"    |    RDA original: {audit_fmt_span(ro_s, ro_e)}"
                 f"    |    Planning: {audit_fmt_span(pl_s, pl_e)}")
+    if result.get("rda_chart_mode") == "cut":
+        subtitle += "    |    RDA CUT VIEW: dashed red outline shows original removed/cut time"
+    elif result.get("rda_chart_mode") == "manual_review":
+        subtitle += "    |    MANUAL REVIEW: bright red flags show RDA rows to verify; RDA times are not cut"
     fig, ax = plt.subplots(figsize=(FIG_W, FIG_H), constrained_layout=False)
     _draw_markers(ax, day_events)
     _draw_day(ax, day_events)
@@ -1849,7 +2692,12 @@ def audit_build_day_fig(data_ctx: dict, result: dict, cid: str, date_str: str):
     for sp in ax.spines.values():
         sp.set_linewidth(0.8)
         sp.set_alpha(0.70)
-    fig.suptitle(f"{collab_label} | {date_str}", fontsize=14, y=0.985, fontweight="bold")
+    title_suffix = (
+        " | RDA CUT" if result.get("rda_chart_mode") == "cut"
+        else " | MANUAL REVIEW" if result.get("rda_chart_mode") == "manual_review"
+        else ""
+    )
+    fig.suptitle(f"{collab_label} | {date_str}{title_suffix}", fontsize=14, y=0.985, fontweight="bold")
     fig.text(0.5, 0.948, km_line, ha="center", va="center", fontsize=10.5, fontweight="bold",
              bbox=dict(facecolor="#f2f2f2", edgecolor="#d0d0d0", boxstyle="round,pad=0.30"))
     fig.text(0.5, 0.915, subtitle, ha="center", va="center", fontsize=9.2, color="#333333")
@@ -1857,7 +2705,7 @@ def audit_build_day_fig(data_ctx: dict, result: dict, cid: str, date_str: str):
              bbox=dict(facecolor="#ffffff", edgecolor="#cfcfcf", boxstyle="round,pad=0.35", alpha=0.96))
     fig.text(0.838, 0.875, next_rest_text, ha="right", va="top", fontsize=8.7, family="monospace", color="#222222",
              bbox=dict(facecolor="#ffffff", edgecolor="#cfcfcf", boxstyle="round,pad=0.35", alpha=0.96))
-    _draw_right_index(fig, day_events, wf_all_text, wf_fs)
+    _draw_right_index(fig, day_events, wf_all_text, rda_all_text)
     fig.subplots_adjust(left=0.065, right=0.855, top=0.72, bottom=0.12)
     return fig
 
@@ -1902,7 +2750,7 @@ def audit_generate_pdfs(result: dict, progress_cb=None):
             grp = grp.sort_values("date_str").reset_index(drop=True)
             cid_values = grp["collab_id"].dropna().astype(str).unique().tolist()
             cid = cid_values[0] if cid_values else "unknown"
-            pdf_name = f"{audit_safe_filename(collab_label)}__collab_{cid}__wf_rda_planning.pdf"
+            pdf_name = f"{audit_safe_filename(collab_label)}__id_{audit_safe_filename(cid)}__wf_rda_planning.pdf"
             pdf_buf = BytesIO()
             pages_written = 0
             with PdfPages(pdf_buf) as pdf:
@@ -2019,6 +2867,209 @@ def audit_render_pdf_controls_live(result: dict) -> None:
         st.rerun()
 
 
+def audit_render_rda_cutting_controls(result: dict) -> None:
+    with st.expander("RDA cutting", expanded=False):
+        st.caption(
+            "Ajuste uniquement la première et la dernière entrée RDA de chaque jour, "
+            "quand un trajet Webfleet chevauche le début ou la fin de service."
+        )
+        c1, c2 = st.columns([1, 2])
+        with c1:
+            run_cutting = st.button("Run RDA cutting", key="audit_run_rda_cutting", use_container_width=True)
+            run_manual_review = st.button(
+                "Run manual review flags",
+                key="audit_run_rda_manual_review",
+                use_container_width=True,
+            )
+        if run_cutting:
+            render_blocking_run_warning()
+            with st.spinner("RDA cutting en cours..."):
+                try:
+                    if "rda_source_df" not in result:
+                        st.warning("Relancez l'audit une fois pour activer l'export RDA au format du fichier d'origine.")
+                        return
+                    st.session_state["latest_rda_cutting_result"] = audit_run_rda_cutting(result)
+                    st.session_state.pop("latest_rda_cutting_pdf_zip", None)
+                except Exception as exc:
+                    st.exception(exc)
+                    return
+        if run_manual_review:
+            render_blocking_run_warning()
+            with st.spinner("Manual review en cours..."):
+                try:
+                    if "rda_source_df" not in result:
+                        st.warning("Relancez l'audit une fois pour activer l'export manual review.")
+                        return
+                    st.session_state["latest_rda_manual_review_result"] = audit_run_rda_manual_review(result)
+                    st.session_state.pop("latest_rda_manual_review_pdf_zip", None)
+                except Exception as exc:
+                    st.exception(exc)
+                    return
+
+        cutting = st.session_state.get("latest_rda_cutting_result")
+        manual_review = st.session_state.get("latest_rda_manual_review_result")
+        with c2:
+            if not cutting and not manual_review:
+                st.info("Lancez le cutting pour générer le fichier RDA ajusté, ou manual review pour obtenir la liste des corrections à faire à la main.")
+            if cutting:
+                metrics = cutting.get("metrics", {})
+                st.success(
+                    f"Cutting: {metrics.get('days_changed', 0)} jour(s), "
+                    f"{metrics.get('rows_changed', 0)} ligne(s), "
+                    f"{metrics.get('minutes_removed', 0.0):.0f} min retirées."
+                )
+                excel_bytes = cutting.get("excel_bytes")
+                if excel_bytes:
+                    excel_bytes.seek(0)
+                    st.download_button(
+                        "Télécharger RDA cutting",
+                        excel_bytes,
+                        file_name=cutting.get("download_name", "rda_cutting.xlsx"),
+                        mime=cutting.get("output_mime", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
+                        key="audit_rda_cutting_download",
+                        use_container_width=True,
+                    )
+            if manual_review:
+                metrics = manual_review.get("metrics", {})
+                st.success(
+                    f"Manual review: {metrics.get('days_changed', 0)} jour(s), "
+                    f"{metrics.get('rows_changed', 0)} ligne(s), "
+                    f"{metrics.get('minutes_removed', 0.0):.0f} min à vérifier."
+                )
+                manual_bytes = manual_review.get("excel_bytes")
+                if manual_bytes:
+                    manual_bytes.seek(0)
+                    st.download_button(
+                        "Télécharger liste manual review",
+                        manual_bytes,
+                        file_name=manual_review.get("download_name", "rda_manual_changes_to_review.xlsx"),
+                        mime=manual_review.get("output_mime", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
+                        key="audit_rda_manual_review_download",
+                        use_container_width=True,
+                    )
+
+        if cutting:
+            cut_summary = cutting.get("cut_summary", pd.DataFrame())
+            if cut_summary.empty:
+                st.info("Aucune entrée RDA n'a été coupée avec les règles actuelles.")
+            else:
+                pdf_cols = st.columns([1, 2])
+                with pdf_cols[0]:
+                    run_cut_pdf = st.button(
+                        "Regénérer PDFs avec cuts",
+                        key="audit_rda_cutting_pdf",
+                        use_container_width=True,
+                    )
+                with pdf_cols[1]:
+                    cut_pdf_zip = st.session_state.get("latest_rda_cutting_pdf_zip")
+                    if cut_pdf_zip:
+                        cut_pdf_zip.seek(0)
+                        st.download_button(
+                            "Télécharger PDFs RDA cut (zip)",
+                            cut_pdf_zip,
+                            file_name="audit_pdfs_rda_cut.zip",
+                            mime="application/zip",
+                            key="audit_rda_cutting_pdf_download",
+                            use_container_width=True,
+                        )
+                    else:
+                        st.caption("Les PDFs RDA cut montrent le temps coupé avec un contour rouge pointillé, et les lignes modifiées avec un contour rouge.")
+
+                if run_cut_pdf:
+                    render_blocking_run_warning()
+                    progress = st.progress(0.0, text="Génération PDFs RDA cut...")
+
+                    def _cut_pdf_progress(pct, msg=None):
+                        progress.progress(min(max(float(pct or 0.0), 0.0), 1.0), text=msg or "Génération PDFs RDA cut...")
+
+                    try:
+                        zip_bytes = audit_generate_cut_pdfs(result, cutting, progress_cb=_cut_pdf_progress)
+                        if zip_bytes:
+                            zip_bytes.seek(0)
+                            st.session_state["latest_rda_cutting_pdf_zip"] = zip_bytes
+                            progress.progress(1.0, text="PDFs RDA cut terminés.")
+                            st.rerun()
+                        else:
+                            progress.empty()
+                            st.info("Aucune donnée à exporter en PDF RDA cut.")
+                    except Exception as exc:
+                        progress.empty()
+                        st.exception(exc)
+
+                preview_cols = [
+                    c for c in [
+                        "collab_id", "collab_name_sarl", "date", "cut_type", "old_start", "new_start",
+                        "old_end", "new_end", "minutes_removed", "wf_trip_count"
+                    ] if c in cut_summary.columns
+                ]
+                st.dataframe(
+                    audit_drop_tz_excel_safe(cut_summary[preview_cols]).head(100),
+                    hide_index=True,
+                    use_container_width=True,
+                )
+
+        if manual_review:
+            worklist = manual_review.get("worklist", pd.DataFrame())
+            if worklist.empty:
+                st.info("Aucune entrée RDA à vérifier avec les règles actuelles.")
+            else:
+                manual_pdf_cols = st.columns([1, 2])
+                with manual_pdf_cols[0]:
+                    run_manual_pdf = st.button(
+                        "Regénérer PDFs manual review",
+                        key="audit_rda_manual_review_pdf",
+                        use_container_width=True,
+                    )
+                with manual_pdf_cols[1]:
+                    manual_pdf_zip = st.session_state.get("latest_rda_manual_review_pdf_zip")
+                    if manual_pdf_zip:
+                        manual_pdf_zip.seek(0)
+                        st.download_button(
+                            "Télécharger PDFs manual review (zip)",
+                            manual_pdf_zip,
+                            file_name="audit_pdfs_rda_manual_review.zip",
+                            mime="application/zip",
+                            key="audit_rda_manual_review_pdf_download",
+                            use_container_width=True,
+                        )
+                    else:
+                        st.caption("Les PDFs manual review gardent les heures RDA originales et marquent les lignes à vérifier en rouge vif.")
+
+                if run_manual_pdf:
+                    render_blocking_run_warning()
+                    progress = st.progress(0.0, text="Génération PDFs manual review...")
+
+                    def _manual_pdf_progress(pct, msg=None):
+                        progress.progress(min(max(float(pct or 0.0), 0.0), 1.0), text=msg or "Génération PDFs manual review...")
+
+                    try:
+                        zip_bytes = audit_generate_manual_review_pdfs(result, manual_review, progress_cb=_manual_pdf_progress)
+                        if zip_bytes:
+                            zip_bytes.seek(0)
+                            st.session_state["latest_rda_manual_review_pdf_zip"] = zip_bytes
+                            progress.progress(1.0, text="PDFs manual review terminés.")
+                            st.rerun()
+                        else:
+                            progress.empty()
+                            st.info("Aucune donnée à exporter en PDF manual review.")
+                    except Exception as exc:
+                        progress.empty()
+                        st.exception(exc)
+
+                preview_cols = [
+                    c for c in [
+                        "collab_id", "collab_name_sarl", "date", "rda_excel_row", "manual_action",
+                        "cut_type", "current_start", "suggested_start", "current_end",
+                        "suggested_end", "suggested_duration_min", "minutes_removed",
+                    ] if c in worklist.columns
+                ]
+                st.dataframe(
+                    audit_drop_tz_excel_safe(worklist[preview_cols]).head(100),
+                    hide_index=True,
+                    use_container_width=True,
+                )
+
+
 # ============================================================
 # Audit — dashboard render
 # ============================================================
@@ -2048,6 +3099,8 @@ def render_audit_dashboard(result: dict) -> None:
         audit_render_pdf_controls_live(result)
     else:
         audit_render_pdf_controls(result)
+
+    audit_render_rda_cutting_controls(result)
 
     # --- In-UI Gantt viewer ---
     chart_data = st.session_state.get("latest_audit_chart_data")
@@ -2323,6 +3376,10 @@ def render_audit_task() -> None:
             st.session_state.pop("latest_audit_pdf_status", None)
             st.session_state.pop("latest_audit_chart_data", None)
             st.session_state.pop("audit_gantt_img", None)
+            st.session_state.pop("latest_rda_cutting_result", None)
+            st.session_state.pop("latest_rda_cutting_pdf_zip", None)
+            st.session_state.pop("latest_rda_manual_review_result", None)
+            st.session_state.pop("latest_rda_manual_review_pdf_zip", None)
             audit_start_pdf_job(result)
         except Exception as exc:
             progress.empty()

@@ -312,10 +312,6 @@ def render_ltr_chart(title: str, df: pd.DataFrame, x_col: str, y_col: str) -> No
             .encode(
                 x=alt.X("Catégorie:N", title=None, sort=None),
                 y=alt.Y("Nombre:Q", title=None),
-                tooltip=[
-                    alt.Tooltip("Catégorie:N", title="Catégorie"),
-                    alt.Tooltip("Nombre:Q", title="Nombre"),
-                ],
             )
             .properties(title=None)
         )
@@ -405,9 +401,9 @@ def render_ltr_task() -> None:
     st.title("Contrôles LTR")
     st.caption("Exécute les contrôles LTR hybrides et crée le classeur Excel multi-feuilles avec un tableau de bord d'audit.")
     st.info(
-        "Conseil: pour contrôler un mois, incluez le RDA depuis 14 jours avant le début du mois jusqu'à 7 jours "
-        "après la fin du mois. Exemple pour mars: du 15 février au 7 avril. Cela permet aux contrôles de repos, "
-        "séries de jours, services qui passent minuit et semaines de 50h de voir le contexte autour du mois."
+        "Conseil: pour contrôler un mois, incluez les données du mois précédent et complétez la semaine en sélectionnant le premier lundi du nouveau mois. "
+        "Par exemple pour mars, incluez les jours de février nécessaires et ajoutez le premier lundi de mars pour avoir la semaine complète. "
+        "Cela permet aux contrôles de repos, séries de jours, services qui passent minuit et semaines de 50h de voir le contexte autour du mois."
     )
 
     cols = st.columns(3)
