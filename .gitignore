@@ -1,6 +1,8 @@
 __pycache__/
 *.pyc
 *.log
+build/
+dist/
 .claude/
 .streamlit/secrets.toml
 .pytest_cache/
