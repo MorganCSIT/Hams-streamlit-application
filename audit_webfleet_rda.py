@@ -27,6 +27,13 @@ def audit_extract_code_any(x):
     return m.group(1) if m else np.nan
 
 
+def audit_extract_prestation_code(x):
+    if pd.isna(x):
+        return np.nan
+    m = re.search(r"(?<!\d)(\d{3,6})(?!\d)", str(x))
+    return m.group(1) if m else np.nan
+
+
 def audit_clean_legend_text(x):
     if pd.isna(x):
         return ""
@@ -352,7 +359,7 @@ def audit_truthy_flag(value) -> bool:
     return bool(value)
 
 
-def audit_build_rda_cut_input_export(result: dict, rda_cut: pd.DataFrame) -> pd.DataFrame:
+def audit_build_rda_cut_input_export(result: dict, rda_cut: pd.DataFrame, include_removed_flag: bool = False) -> pd.DataFrame:
     source = result.get("rda_source_df")
     rda_cols = result.get("rda_cols", {})
     if source is None or source.empty:
@@ -379,11 +386,14 @@ def audit_build_rda_cut_input_export(result: dict, rda_cut: pd.DataFrame) -> pd.
     after_end = []
     minutes_removed = []
     actions = []
+    removed_flags = []
 
     for row_pos in range(len(out)):
         cut_row = by_id.loc[row_pos] if row_pos in by_id.index else None
         action = "" if cut_row is None else str(cut_row.get("rda_cut_action", "") or "")
+        row_removed = False if cut_row is None else audit_truthy_flag(cut_row.get("rda_cut_removed", False))
         actions.append(action)
+        removed_flags.append(row_removed)
 
         old_start = pd.NaT if cut_row is None else cut_row.get("start", pd.NaT)
         new_start = pd.NaT if cut_row is None else cut_row.get("cut_start", pd.NaT)
@@ -399,6 +409,8 @@ def audit_build_rda_cut_input_export(result: dict, rda_cut: pd.DataFrame) -> pd.
 
         if not action:
             continue
+        if row_removed:
+            continue
         if start_col in out.columns and pd.notna(new_start):
             out.at[row_pos, start_col] = audit_cut_format_time_like(out.at[row_pos, start_col], new_start)
         if end_col in out.columns and pd.notna(new_end):
@@ -412,7 +424,9 @@ def audit_build_rda_cut_input_export(result: dict, rda_cut: pd.DataFrame) -> pd.
     audit_append_unique_column(out, "Before_cut_end", before_end)
     audit_append_unique_column(out, "After_cut_end", after_end)
     audit_append_unique_column(out, "Cut_minutes_removed", minutes_removed)
-    if removed_ids:
+    if include_removed_flag:
+        audit_append_unique_column(out, "removed", removed_flags)
+    elif removed_ids:
         out = out.drop(index=[idx for idx in out.index if int(idx) in removed_ids], errors="ignore").reset_index(drop=True)
     return out
 
@@ -668,6 +682,7 @@ def audit_run_rda_cutting(result: dict, chain_gap_min: int = 15, tail_window_min
         - pd.to_numeric(rda["cut_duree_min"], errors="coerce")
     ).clip(lower=0)
     rda_input_export = audit_build_rda_cut_input_export(result, rda)
+    rda_input_export_with_removed = audit_build_rda_cut_input_export(result, rda, include_removed_flag=True)
 
     cut_summary = pd.DataFrame(cut_rows)
     wf_trips_used = pd.DataFrame(wf_used_rows)
@@ -708,6 +723,7 @@ def audit_run_rda_cutting(result: dict, chain_gap_min: int = 15, tail_window_min
     return {
         "rda_cut": rda,
         "rda_input_export": rda_input_export,
+        "rda_input_export_with_removed": rda_input_export_with_removed,
         "cut_summary": cut_summary,
         "wf_trips_used": wf_trips_used,
         "excel_bytes": excel_bytes,
@@ -739,6 +755,80 @@ def audit_build_cut_chart_result(result: dict, cutting: dict) -> dict:
 def audit_generate_cut_pdfs(result: dict, cutting: dict, progress_cb=None):
     cut_result = audit_build_cut_chart_result(result, cutting)
     return audit_generate_pdfs(cut_result, progress_cb=progress_cb)
+
+
+def audit_cut_changed_pairs(cutting: dict) -> set[tuple[str, str]]:
+    cut_summary = cutting.get("cut_summary", pd.DataFrame()).copy()
+    if cut_summary.empty or not {"collab_id", "date"}.issubset(cut_summary.columns):
+        return set()
+    pairs = set()
+    for _, row in cut_summary[["collab_id", "date"]].dropna().drop_duplicates().iterrows():
+        day = pd.to_datetime(row["date"], errors="coerce", dayfirst=True)
+        if pd.isna(day):
+            continue
+        pairs.add((str(row["collab_id"]), pd.Timestamp(day).strftime("%Y-%m-%d")))
+    return pairs
+
+
+def audit_build_rda_cutting_package(result: dict, cutting: dict, progress_cb=None) -> dict:
+    output_dir = get_session_output_root(AUDIT_OUTPUT_FOLDER)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    package_name = f"{Path(cutting.get('download_name', 'rda_cutting.xlsx')).stem}_with_day_charts.zip"
+    package_path = output_dir / f"rda_cutting_package_{timestamp}.zip"
+
+    package_buf = BytesIO()
+    with zipfile.ZipFile(package_buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        excel_bytes = cutting.get("excel_bytes")
+        if excel_bytes:
+            excel_bytes.seek(0)
+            zf.writestr(f"Adjusted_RDA/{cutting.get('download_name', 'rda_cutting.xlsx')}", excel_bytes.read())
+        rda_input_export = cutting.get("rda_input_export", pd.DataFrame())
+        if rda_input_export is not None and not rda_input_export.empty:
+            csv_name = f"{Path(cutting.get('download_name', 'rda_cutting.xlsx')).stem}_RDA_Cut_Input_Format.csv"
+            csv_text = audit_drop_tz_excel_safe(rda_input_export).to_csv(index=False)
+            zf.writestr(f"Adjusted_RDA/{csv_name}", csv_text.encode("utf-8-sig"))
+        rda_input_export_with_removed = cutting.get("rda_input_export_with_removed", pd.DataFrame())
+        if rda_input_export_with_removed is not None and not rda_input_export_with_removed.empty:
+            removed_stem = f"{Path(cutting.get('download_name', 'rda_cutting.xlsx')).stem}_RDA_Cut_Input_Format_With_Removed"
+            removed_safe = audit_drop_tz_excel_safe(rda_input_export_with_removed)
+            zf.writestr(
+                f"Adjusted_RDA/{removed_stem}.csv",
+                removed_safe.to_csv(index=False).encode("utf-8-sig"),
+            )
+            removed_xlsx = BytesIO()
+            with pd.ExcelWriter(removed_xlsx, engine="openpyxl") as xw:
+                removed_safe.to_excel(xw, index=False, sheet_name="RDA_With_Removed")
+            removed_xlsx.seek(0)
+            zf.writestr(f"Adjusted_RDA/{removed_stem}.xlsx", removed_xlsx.read())
+
+        changed_pairs = audit_cut_changed_pairs(cutting)
+        if changed_pairs:
+            review_result = audit_build_manual_review_chart_result(result, cutting)
+            pdf_zip = audit_generate_pdfs(
+                review_result,
+                progress_cb=progress_cb,
+                include_pairs=changed_pairs,
+                zip_prefix="PDF_Day_Charts_Before_Cut/",
+            )
+            if pdf_zip:
+                pdf_zip.seek(0)
+                with zipfile.ZipFile(pdf_zip, "r") as pdf_zf:
+                    for info in pdf_zf.infolist():
+                        if info.is_dir():
+                            continue
+                        zf.writestr(info.filename, pdf_zf.read(info.filename))
+
+    package_buf.seek(0)
+    with open(package_path, "wb") as f:
+        f.write(package_buf.getvalue())
+    package_buf.seek(0)
+    return {
+        "zip_bytes": package_buf,
+        "zip_path": package_path,
+        "download_name": package_name,
+        "output_mime": "application/zip",
+    }
 
 
 def audit_build_manual_review_worklist(result: dict, cutting: dict) -> pd.DataFrame:
@@ -1253,7 +1343,7 @@ def audit_process(rda_file, wf_file, mapping_file, planning_file, progress_cb=No
             best_col = col
     rda["prestation_code"] = np.nan
     if best_col is not None:
-        rda["prestation_code"] = RDA[best_col].apply(audit_extract_code_any)
+        rda["prestation_code"] = RDA[best_col].apply(audit_extract_prestation_code)
         if not rda_cols["prestation_name"]:
             rda["prestation_text"] = RDA[best_col].apply(audit_clean_legend_text)
     rda["rda_row_id"] = np.arange(len(rda), dtype=int)
@@ -2002,6 +2092,8 @@ def audit_build_chart_data(result: dict):
 
     def _cmp_rda_orig_color(code):
         code = str(code).strip() if pd.notna(code) else ""
+        if code in AUDIT_RDA_BROWN_PRESTATION_CODES:
+            return AUDIT_RDA_BROWN_PRESTATION_COLOR
         if code in ["16009", "95900"]:
             return "#FFD700"
         if code == str(AUDIT_PRESTATION_61010_CODE):
@@ -2067,6 +2159,7 @@ def audit_build_chart_data(result: dict):
             "label_text": f"{int(round(audit_duration_mins(s, e)))}m", "label_y": -0.20, "label_color": "#222222",
             "km_label": km_txt, "km_label_y": -0.38 if ((wf_idx - 1) % 2 == 0) else -0.48,
             "km_label_color": "#d62728" if is_suspect else "#111111", "wf_index": wf_idx,
+            "tripmode": tm if tm in [1, 2, 3] else "",
         })
 
     rda_local = rda.dropna(subset=["collab_id", "start", "end"]).copy()
@@ -2097,7 +2190,7 @@ def audit_build_chart_data(result: dict):
         if was_cut:
             action_label = cut_action.replace("_", " ")
             cut_prefix = "CHECK" if is_manual_review else "CUT"
-            cut_minutes_label = f"{cut_prefix} {int(round(float(cut_removed)))}m" if pd.notna(cut_removed) else cut_prefix
+            cut_minutes_label = f"-{int(round(float(cut_removed)))}m" if pd.notna(cut_removed) else cut_prefix
             base_label = "" if is_removed else base_label
         rows_ev.append({
             "collab_id": cid, "collab_label": collab_labels.get(cid, cid), "date_str": date_str,
@@ -2117,6 +2210,8 @@ def audit_build_chart_data(result: dict):
             "cut_action": action_label if was_cut else "",
             "cut_minutes_removed": cut_removed if was_cut else np.nan,
             "cut_minutes_label": cut_minutes_label,
+            "suggested_start": _to_ln(getattr(rr, "cut_start", pd.NaT)) if was_cut else pd.NaT,
+            "suggested_end": _to_ln(getattr(rr, "cut_end", pd.NaT)) if was_cut else pd.NaT,
             "original_start": _to_ln(getattr(rr, "original_start", pd.NaT)) if was_cut and not is_manual_review else pd.NaT,
             "original_end": _to_ln(getattr(rr, "original_end", pd.NaT)) if was_cut and not is_manual_review else pd.NaT,
         })
@@ -2262,8 +2357,10 @@ def audit_build_day_fig(data_ctx: dict, result: dict, cid: str, date_str: str):
             e = audit_fmt_hhmm(row["right"])
             mins = audit_duration_mins(row["left"], row["right"])
             mins_txt = f"{int(round(mins))}m" if pd.notna(mins) else "-"
-            km_txt = f" | {str(row.get('km_label', '')).strip()}" if str(row.get("km_label", "")).strip() else ""
-            lines.append(f"{idx_txt}. {s} → {e} ({mins_txt}){km_txt}")
+            mode = row.get("tripmode", "")
+            mode_txt = f"M{int(mode)}" if pd.notna(mode) and str(mode).strip() else "M-"
+            km_txt = str(row.get("km_label", "")).strip() or "-"
+            lines.append(f"{idx_txt} {mode_txt:<2} {s}-{e} {mins_txt:>4} {km_txt:>7}")
         return "ALL WF TRIPS\n" + "\n".join(lines)
 
     def _rda_all_text(day_events):
@@ -2618,17 +2715,10 @@ def audit_build_day_fig(data_ctx: dict, result: dict, cid: str, date_str: str):
                     marker="v", s=70, color="#d00000", edgecolors="#ffffff", linewidths=0.7,
                     zorder=8, clip_on=False,
                 )
-                if not is_removed:
-                    ax.text(
-                        mdates.date2num(mid), y + 0.42, cut_action, ha="center", va="center",
-                        fontsize=7.4, color="#ffffff", fontweight="bold", zorder=8, clip_on=False,
-                        bbox=dict(facecolor="#d00000", edgecolor="#d00000", alpha=0.95, boxstyle="round,pad=0.20"),
-                    )
                 cut_minutes_label = audit_clean_legend_text(rr.get("cut_minutes_label", ""))
                 if cut_minutes_label:
-                    minutes_y = y + 0.42 if is_removed else y + 0.60
                     ax.text(
-                        mdates.date2num(mid), minutes_y, cut_minutes_label, ha="center", va="center",
+                        mdates.date2num(mid), y + 0.46, cut_minutes_label, ha="center", va="center",
                         fontsize=8.0, color="#d00000", fontweight="bold", zorder=8, clip_on=False,
                         bbox=dict(facecolor="#ffffff", edgecolor="none", alpha=0.72, pad=0.12),
                     )
@@ -2714,7 +2804,7 @@ def audit_build_day_fig(data_ctx: dict, result: dict, cid: str, date_str: str):
 # Audit — PDF generation (optional, requires matplotlib)
 # ============================================================
 
-def audit_generate_pdfs(result: dict, progress_cb=None):
+def audit_generate_pdfs(result: dict, progress_cb=None, include_pairs: set[tuple[str, str]] | None = None, zip_prefix: str = ""):
     try:
         import matplotlib
         matplotlib.use("Agg")
@@ -2731,6 +2821,13 @@ def audit_generate_pdfs(result: dict, progress_cb=None):
     pairs = events_cmp[["collab_id", "collab_label", "date_str"]].drop_duplicates().copy()
     pairs["collab_id"] = pairs["collab_id"].astype(str)
     pairs["date_str"] = pairs["date_str"].astype(str)
+    if include_pairs is not None:
+        include_pairs = {(str(cid), str(day)) for cid, day in include_pairs}
+        pairs = pairs[
+            pairs.apply(lambda row: (str(row["collab_id"]), str(row["date_str"])) in include_pairs, axis=1)
+        ].copy()
+        if pairs.empty:
+            return None
     pairs = pairs.sort_values(["collab_label", "date_str"]).reset_index(drop=True)
 
     collab_groups = list(pairs.groupby("collab_label", sort=True))
@@ -2751,6 +2848,7 @@ def audit_generate_pdfs(result: dict, progress_cb=None):
             cid_values = grp["collab_id"].dropna().astype(str).unique().tolist()
             cid = cid_values[0] if cid_values else "unknown"
             pdf_name = f"{audit_safe_filename(collab_label)}__id_{audit_safe_filename(cid)}__wf_rda_planning.pdf"
+            pdf_name = f"{zip_prefix}{pdf_name}" if zip_prefix else pdf_name
             pdf_buf = BytesIO()
             pages_written = 0
             with PdfPages(pdf_buf) as pdf:
@@ -2888,8 +2986,21 @@ def audit_render_rda_cutting_controls(result: dict) -> None:
                     if "rda_source_df" not in result:
                         st.warning("Relancez l'audit une fois pour activer l'export RDA au format du fichier d'origine.")
                         return
-                    st.session_state["latest_rda_cutting_result"] = audit_run_rda_cutting(result)
+                    cutting_result = audit_run_rda_cutting(result)
+                    st.session_state["latest_rda_cutting_result"] = cutting_result
                     st.session_state.pop("latest_rda_cutting_pdf_zip", None)
+                    st.session_state.pop("latest_rda_cutting_package", None)
+                    progress = st.progress(0.0, text="Préparation du zip RDA cutting + PDFs...")
+
+                    def _package_progress(pct, msg=None):
+                        progress.progress(
+                            min(max(float(pct or 0.0), 0.0), 1.0),
+                            text=msg or "Préparation du zip RDA cutting + PDFs...",
+                        )
+
+                    package = audit_build_rda_cutting_package(result, cutting_result, progress_cb=_package_progress)
+                    st.session_state["latest_rda_cutting_package"] = package
+                    progress.progress(1.0, text="Zip RDA cutting + PDFs prêt.")
                 except Exception as exc:
                     st.exception(exc)
                     return
@@ -2918,17 +3029,31 @@ def audit_render_rda_cutting_controls(result: dict) -> None:
                     f"{metrics.get('rows_changed', 0)} ligne(s), "
                     f"{metrics.get('minutes_removed', 0.0):.0f} min retirées."
                 )
-                excel_bytes = cutting.get("excel_bytes")
-                if excel_bytes:
-                    excel_bytes.seek(0)
+                package = st.session_state.get("latest_rda_cutting_package")
+                if package and package.get("zip_bytes"):
+                    zip_bytes = package["zip_bytes"]
+                    zip_bytes.seek(0)
                     st.download_button(
-                        "Télécharger RDA cutting",
-                        excel_bytes,
-                        file_name=cutting.get("download_name", "rda_cutting.xlsx"),
-                        mime=cutting.get("output_mime", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
+                        "Télécharger RDA cutting + charts (zip)",
+                        zip_bytes,
+                        file_name=package.get("download_name", "rda_cutting_with_day_charts.zip"),
+                        mime=package.get("output_mime", "application/zip"),
                         key="audit_rda_cutting_download",
                         use_container_width=True,
                     )
+                    st.caption("Le zip contient l'RDA ajusté et le dossier PDF_Day_Charts_Before_Cut avec seulement les jours modifiés.")
+                else:
+                    excel_bytes = cutting.get("excel_bytes")
+                    if excel_bytes:
+                        excel_bytes.seek(0)
+                        st.download_button(
+                            "Télécharger RDA cutting",
+                            excel_bytes,
+                            file_name=cutting.get("download_name", "rda_cutting.xlsx"),
+                            mime=cutting.get("output_mime", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
+                            key="audit_rda_cutting_download",
+                            use_container_width=True,
+                        )
             if manual_review:
                 metrics = manual_review.get("metrics", {})
                 st.success(
