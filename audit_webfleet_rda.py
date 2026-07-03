@@ -484,12 +484,15 @@ def audit_run_rda_cutting(result: dict, chain_gap_min: int = 15, tail_window_min
         cand = trips[(trips["end"] > first_start) & (trips["start"] < first_end)].copy()
         if cand.empty:
             return cand
+        crosses_first_start = (cand["start"] <= first_start) & (cand["end"] > first_start)
+        if not crosses_first_start.any():
+            return cand.iloc[0:0].copy()
         cand = cand.sort_values(["start", "end"]).reset_index(drop=True)
         chain_idxs = []
         current_end = None
         for idx, rr in cand.iterrows():
             if not chain_idxs:
-                if rr["start"] <= first_start or rr["start"] <= first_start + pd.Timedelta(minutes=chain_gap_min):
+                if rr["start"] <= first_start and rr["end"] > first_start:
                     chain_idxs.append(idx)
                     current_end = rr["end"]
                     if current_end > first_start:
@@ -508,12 +511,15 @@ def audit_run_rda_cutting(result: dict, chain_gap_min: int = 15, tail_window_min
         cand = trips[(trips["end"] > last_start) & (trips["start"] <= anchor_limit)].copy()
         if cand.empty:
             return cand
-        tail_anchor = (cand["end"] >= last_end) | ((cand["start"] >= last_end) & (cand["start"] <= anchor_limit))
+        crosses_last_end = (cand["start"] < last_end) & (cand["end"] >= last_end)
+        if not crosses_last_end.any():
+            return cand.iloc[0:0].copy()
+        tail_anchor = crosses_last_end
         if not tail_anchor.any():
             return cand.iloc[0:0].copy()
         cand = cand.loc[:tail_anchor[tail_anchor].index.max()].copy()
         cand = cand.sort_values(["start", "end"]).reset_index(drop=True)
-        tail_anchor = (cand["end"] >= last_end) | ((cand["start"] >= last_end) & (cand["start"] <= anchor_limit))
+        tail_anchor = (cand["start"] < last_end) & (cand["end"] >= last_end)
         latest_idx = cand.loc[tail_anchor, "start"].idxmax()
         chain = [latest_idx]
         current_start = cand.loc[latest_idx, "start"]
@@ -1668,6 +1674,8 @@ def audit_process(rda_file, wf_file, mapping_file, planning_file, progress_cb=No
     def _interval_overlap(a_s, a_e, b_s, b_e):
         if pd.isna(a_s) or pd.isna(a_e) or pd.isna(b_s) or pd.isna(b_e):
             return False
+        if a_s < b_s:
+            return False
         ov_s = max(a_s, b_s)
         ov_e = min(a_e, b_e)
         ov_min = (ov_e - ov_s).total_seconds() / 60.0
@@ -2164,7 +2172,8 @@ def audit_build_chart_data(result: dict):
 
     rda_local = rda.dropna(subset=["collab_id", "start", "end"]).copy()
     rda_local["collab_id"] = rda_local["collab_id"].astype(str)
-    for rr in rda_local.itertuples(index=False):
+    rda_stack = {}
+    for rr in rda_local.sort_values(["collab_id", "start", "end"]).itertuples(index=False):
         s = _to_ln(rr.start)
         e = _to_ln(rr.end)
         if pd.isna(s) or pd.isna(e) or e <= s:
@@ -2174,6 +2183,9 @@ def audit_build_chart_data(result: dict):
         date_str = _cmp_date_str(jour_value, fallback_ts=s)
         if not date_str:
             continue
+        day_key = (cid, date_str)
+        rda_idx = rda_stack.get(day_key, 0) + 1
+        rda_stack[day_key] = rda_idx
         code = getattr(rr, "prestation_code", np.nan)
         prestation_text = getattr(rr, "prestation_text", "")
         code_key = str(code).strip() if pd.notna(code) else ""
@@ -2204,6 +2216,7 @@ def audit_build_chart_data(result: dict):
             "label_text": base_label, "label_y": 0.80,
             "label_color": "#d00000" if was_cut else ("#b30000" if is_61010 else "#111111"),
             "km_label": "", "km_label_y": np.nan, "km_label_color": "#111111", "wf_index": np.nan,
+            "rda_index": rda_idx,
             "client_nr": client_nr, "client_label": client_name or (f"Client {client_nr}" if client_nr else ""),
             "event_color": "", "event_color_key": "",
             "prestation_code": code_key, "prestation_text": _prestation_desc(code_key, prestation_text),
@@ -2241,6 +2254,7 @@ def audit_build_chart_data(result: dict):
             "line_width": 1.0,
             "label_text": f"{int(round(audit_duration_mins(s, e)))}m", "label_y": 1.80, "label_color": "#111111",
             "km_label": "", "km_label_y": np.nan, "km_label_color": "#111111", "wf_index": np.nan,
+            "rda_index": np.nan,
             "client_nr": client_nr, "client_label": client_label,
             "event_color": event_color, "event_color_key": event_color_key,
             "prestation_code": "", "prestation_text": "",
@@ -2369,7 +2383,8 @@ def audit_build_day_fig(data_ctx: dict, result: dict, cid: str, date_str: str):
             return "ALL RDA PRESTATIONS\n-"
         lines = []
         for idx, row in sub.iterrows():
-            idx_txt = f"{idx + 1:02d}"
+            idx_val = row.get("rda_index", np.nan)
+            idx_txt = f"{int(idx_val):02d}" if pd.notna(idx_val) else f"{idx + 1:02d}"
             s = audit_fmt_hhmm(row["left"])
             e = audit_fmt_hhmm(row["right"])
             mins = audit_duration_mins(row["left"], row["right"])
@@ -2726,6 +2741,12 @@ def audit_build_day_fig(data_ctx: dict, result: dict, cid: str, date_str: str):
                 wf_idx = rr.get("wf_index", np.nan)
                 if pd.notna(mid) and pd.notna(wf_idx):
                     ax.text(mdates.date2num(mid), float(rr["y"]) + 0.26, f"{int(wf_idx)}", ha="center", va="center",
+                            fontsize=8.3, color="#000000", fontweight="bold", zorder=7, clip_on=False,
+                            bbox=dict(facecolor="white", edgecolor="#222222", alpha=0.88, boxstyle="round,pad=0.18"))
+            if str(rr["kind"]) == "RDA_ORIG":
+                rda_idx = rr.get("rda_index", np.nan)
+                if pd.notna(mid) and pd.notna(rda_idx):
+                    ax.text(mdates.date2num(mid), float(rr["y"]) + 0.26, f"{int(rda_idx)}", ha="center", va="center",
                             fontsize=8.3, color="#000000", fontweight="bold", zorder=7, clip_on=False,
                             bbox=dict(facecolor="white", edgecolor="#222222", alpha=0.88, boxstyle="round,pad=0.18"))
             km_lab = str(rr.get("km_label", "") or "").strip()

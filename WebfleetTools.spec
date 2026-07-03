@@ -1,7 +1,7 @@
 # -*- mode: python ; coding: utf-8 -*-
 from PyInstaller.utils.hooks import collect_all
 
-datas = [('app.py', '.'), ('app_config.py', '.'), ('audit_webfleet_rda.py', '.'), ('ltr_checks.py', '.'), ('merge_files.py', '.'), ('nexus_batch_runner.py', '.'), ('rda_transfers.py', '.'), ('ui_common.py', '.'), ('webfleet.py', '.'), ('company colors.png', '.'), ('feedback.png', '.'), ('.streamlit', '.streamlit'), ('Templates', 'Templates')]
+datas = [('app.py', '.'), ('app_config.py', '.'), ('audit_webfleet_rda.py', '.'), ('ltr_checks.py', '.'), ('merge_files.py', '.'), ('nexus_batch_runner.py', '.'), ('rda_transfers.py', '.'), ('ui_common.py', '.'), ('webfleet.py', '.'), ('company colors.png', '.'), ('feedback.png', '.'), ('.streamlit', '.streamlit'), ('Scripts', 'Scripts'), ('Templates', 'Templates')]
 binaries = []
 hiddenimports = []
 tmp_ret = collect_all('streamlit')

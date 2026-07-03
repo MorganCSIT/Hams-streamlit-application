@@ -3,6 +3,7 @@ __pycache__/
 *.log
 build/
 dist/
+.build_tools/
 .claude/
 .streamlit/secrets.toml
 .pytest_cache/

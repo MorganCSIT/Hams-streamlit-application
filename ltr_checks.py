@@ -10,6 +10,10 @@ def ltr_unique_output_root(output_name: str) -> Path:
     return root
 
 
+def ltr_workbook_path(output_root: Path) -> Path:
+    return output_root / "multiple" / f"{output_root.name}.xlsx"
+
+
 def ltr_save_upload(uploaded_file, target_dir: Path) -> Path:
     target_dir.mkdir(parents=True, exist_ok=True)
     path = target_dir / uploaded_file.name
@@ -76,6 +80,13 @@ def ltr_load_notebook_functions(notebook_mtime: float) -> dict:
         source = "".join(notebook["cells"][cell_index]["source"])
         exec(compile(source, f"{notebook_path.name}:cell{cell_index + 1}", "exec"), env)
     return env
+
+
+def ltr_notebook_mtime() -> float:
+    notebook_path = LTR_NOTEBOOK_PATH
+    if not notebook_path.exists():
+        raise FileNotFoundError(f"LTR notebook not found: {notebook_path}")
+    return notebook_path.stat().st_mtime
 
 
 def ltr_compute_summary(env: dict, df: pd.DataFrame, services_df: pd.DataFrame, calendar_slices_df: pd.DataFrame, all_infractions: pd.DataFrame, data_quality: pd.DataFrame) -> pd.DataFrame:
@@ -145,10 +156,9 @@ def ltr_process(matched_upload, rda_upload, output_name: str) -> dict:
     input_dir = output_root / "inputs"
     matched_path = ltr_save_upload(matched_upload, input_dir)
     rda_path = ltr_save_upload(rda_upload, input_dir)
-    workbook_path = output_root / "multiple" / "LTR_CHECKS_MULTIPLE_ALL_MONTHS_HYBRID.xlsx"
+    workbook_path = ltr_workbook_path(output_root)
 
-    notebook_path = LTR_NOTEBOOK_PATH
-    env = ltr_load_notebook_functions(notebook_path.stat().st_mtime)
+    env = ltr_load_notebook_functions(ltr_notebook_mtime())
 
     df_raw = env["load_and_normalize"](str(rda_path))
     matched = env["load_matched_collabs"](str(matched_path))
