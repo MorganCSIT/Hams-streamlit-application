@@ -1,8 +1,11 @@
 __pycache__/
 *.pyc
 *.log
+*.pid
 build/
 dist/
+build_*/
+dist_*/
 .build_tools/
 .claude/
 .streamlit/secrets.toml
@@ -15,6 +18,9 @@ LTRReports/
 MergedReports/
 RDAReports/
 WebfleetReports/
+
+SFTP_Automation/Downloaded_Server_Files_All/
+SFTP_Automation/_automation_logs/
 
 *.tar
 *.zip

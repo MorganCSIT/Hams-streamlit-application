@@ -5,6 +5,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 import uuid
@@ -24,7 +25,7 @@ import requests
 import streamlit as st
 
 
-APP_ROOT = Path(__file__).resolve().parent
+APP_ROOT = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
 BASE_URL = "https://csv.webfleet.com/extern"
 API_ACTION = "showTripReportExtern"
 LANG = "en"
@@ -107,8 +108,8 @@ AUDIT_PLANNING_DATE_MAX_YEAR = 2100
 TASKS = {
     "home": "Accueil",
     "webfleet": "Téléchargement Webfleet",
+    "planning": "Téléchargement planning",
     "merge": "Fusionner des fichiers",
-    "rda": "Transferts RDA",
     "ltr": "Contrôles LTR",
     "audit": "Audit Webfleet-RDA",
 }

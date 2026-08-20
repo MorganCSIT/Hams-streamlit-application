@@ -1,5 +1,6 @@
 import os
 import socket
+import subprocess
 import sys
 import threading
 import time
@@ -25,9 +26,49 @@ def _find_free_port(start: int = 8501, end: int = 8599) -> int:
     raise RuntimeError("No free local port found for Streamlit.")
 
 
+def _browser_candidates() -> list[Path]:
+    candidates: list[Path] = []
+
+    for env_name in ("PROGRAMFILES", "PROGRAMFILES(X86)", "LOCALAPPDATA"):
+        base = os.environ.get(env_name)
+        if not base:
+            continue
+        candidates.extend(
+            [
+                Path(base) / "Microsoft" / "Edge" / "Application" / "msedge.exe",
+                Path(base) / "Google" / "Chrome" / "Application" / "chrome.exe",
+            ]
+        )
+
+    return candidates
+
+
+def _wait_for_streamlit(port: int, timeout: float = 20.0) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.settimeout(0.5)
+            if sock.connect_ex(("127.0.0.1", port)) == 0:
+                return
+        time.sleep(0.25)
+
+
 def _open_browser(port: int) -> None:
     url = f"http://127.0.0.1:{port}"
-    time.sleep(2.5)
+    _wait_for_streamlit(port)
+
+    for browser_path in _browser_candidates():
+        if browser_path.exists():
+            try:
+                subprocess.Popen(
+                    [str(browser_path), f"--app={url}", "--new-window"],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                return
+            except OSError:
+                continue
+
     webbrowser.open(url)
 
 

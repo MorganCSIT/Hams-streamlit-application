@@ -1,7 +1,7 @@
 from app_config import *
 import concurrent.futures
 
-from ui_common import read_csv_flex, render_blocking_run_warning, render_download_or_placeholder
+from ui_common import read_csv_flex, render_blocking_run_warning
 
 
 def rda_pick_col(df: pd.DataFrame, candidates: list[str]) -> str | None:
@@ -39,6 +39,87 @@ def audit_clean_legend_text(x):
         return ""
     s = re.sub(r"\s+", " ", str(x).strip())
     return "" if s.lower() in {"nan", "nat", "none", "<na>"} else s
+
+
+def audit_clean_report_text(value) -> str:
+    if value is None:
+        return ""
+    text = str(value).strip()
+    return "" if text.lower() in {"", "nan", "none", "nat", "<na>"} else text
+
+
+def audit_mapping_report_columns() -> list[str]:
+    return ["Entity Type", "Source", "Name", "ID", "Match Status", "Row Count"]
+
+
+def audit_mapping_report_from_rows(rows: list[dict]) -> pd.DataFrame:
+    columns = audit_mapping_report_columns()
+    if not rows:
+        return pd.DataFrame(columns=columns)
+    report = pd.DataFrame(rows)
+    for col in columns:
+        if col not in report.columns:
+            report[col] = ""
+    report["Name"] = report["Name"].map(audit_clean_report_text)
+    report["ID"] = report["ID"].map(audit_clean_report_text)
+    report["Match Status"] = report["Match Status"].map(audit_clean_report_text).replace({"": "UNMATCHED"})
+    report["Row Count"] = pd.to_numeric(report["Row Count"], errors="coerce").fillna(0).astype(int)
+    return (
+        report[columns]
+        .sort_values(["Entity Type", "Source", "Row Count", "Name", "ID"], ascending=[True, True, False, True, True])
+        .reset_index(drop=True)
+    )
+
+
+def audit_client_known_ids(map_sheets: dict) -> set[str]:
+    clients = map_sheets.get("Matched Clients")
+    if clients is None or clients.empty:
+        return set()
+    clients = clients.copy()
+    clients.columns = clients.columns.astype(str).str.strip().str.lstrip("\ufeff")
+    client_no_cols = [
+        col for col in clients.columns
+        if str(col).strip().lower().startswith("no-client-")
+        or str(col).strip().lower() in {"no client", "n° du client", "id client", "client no", "client_nr", "kd-nr", "kd_nr"}
+    ]
+    known_ids = set()
+    for col in client_no_cols:
+        known_ids.update(
+            str(value)
+            for value in clients[col].apply(audit_to_int_str).tolist()
+            if value and re.fullmatch(r"\d+", str(value))
+        )
+    return known_ids
+
+
+def audit_unmatched_entity_summary(
+    df: pd.DataFrame,
+    entity_type: str,
+    source: str,
+    id_col: str,
+    name_col: str | None,
+    status: str,
+) -> pd.DataFrame:
+    columns = audit_mapping_report_columns()
+    if df is None or df.empty or id_col not in df.columns:
+        return pd.DataFrame(columns=columns)
+    ids = df[id_col].apply(audit_to_int_str)
+    names = df[name_col].map(audit_clean_report_text) if name_col and name_col in df.columns else pd.Series([""] * len(df), index=df.index)
+    work = pd.DataFrame({
+        "Entity Type": entity_type,
+        "Source": source,
+        "Name": names,
+        "ID": ids,
+        "Match Status": status,
+    })
+    work = work[work["ID"].map(audit_clean_report_text).astype(str).str.len() > 0].copy()
+    if work.empty:
+        return pd.DataFrame(columns=columns)
+    return (
+        work.groupby(["Entity Type", "Source", "Name", "ID", "Match Status"], dropna=False)
+        .size()
+        .reset_index(name="Row Count")
+    )[columns]
 
 
 def audit_shorten_text(text, max_len):
@@ -776,7 +857,28 @@ def audit_cut_changed_pairs(cutting: dict) -> set[tuple[str, str]]:
     return pairs
 
 
-def audit_build_rda_cutting_package(result: dict, cutting: dict, progress_cb=None) -> dict:
+def audit_pdf_pairs_for_date_range(result: dict, start_date: date, end_date: date) -> set[tuple[str, str]]:
+    data_ctx = audit_build_chart_data(result)
+    if data_ctx is None:
+        return set()
+    events_cmp = data_ctx.get("events_cmp", pd.DataFrame())
+    if events_cmp.empty or not {"collab_id", "date_str"}.issubset(events_cmp.columns):
+        return set()
+    days = pd.to_datetime(events_cmp["date_str"], errors="coerce").dt.date
+    mask = days.apply(lambda value: pd.notna(value) and start_date <= value <= end_date)
+    pairs = events_cmp.loc[mask, ["collab_id", "date_str"]].dropna().drop_duplicates()
+    return {(str(row["collab_id"]), str(row["date_str"])) for _, row in pairs.iterrows()}
+
+
+def audit_previous_full_week(today: date | None = None) -> tuple[date, date]:
+    today = today or date.today()
+    this_monday = today - timedelta(days=today.weekday())
+    previous_sunday = this_monday - timedelta(days=1)
+    previous_monday = previous_sunday - timedelta(days=6)
+    return previous_monday, previous_sunday
+
+
+def audit_build_rda_cutting_package(result: dict, cutting: dict, progress_cb=None, include_pairs: set[tuple[str, str]] | None = None) -> dict:
     output_dir = get_session_output_root(AUDIT_OUTPUT_FOLDER)
     output_dir.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -809,6 +911,9 @@ def audit_build_rda_cutting_package(result: dict, cutting: dict, progress_cb=Non
             zf.writestr(f"Adjusted_RDA/{removed_stem}.xlsx", removed_xlsx.read())
 
         changed_pairs = audit_cut_changed_pairs(cutting)
+        if include_pairs is not None:
+            include_pairs = {(str(cid), str(day)) for cid, day in include_pairs}
+            changed_pairs = changed_pairs & include_pairs
         if changed_pairs:
             review_result = audit_build_manual_review_chart_result(result, cutting)
             pdf_zip = audit_generate_pdfs(
@@ -834,6 +939,75 @@ def audit_build_rda_cutting_package(result: dict, cutting: dict, progress_cb=Non
         "zip_path": package_path,
         "download_name": package_name,
         "output_mime": "application/zip",
+    }
+
+
+def audit_build_complete_package(result: dict, progress_cb=None, include_pairs: set[tuple[str, str]] | None = None) -> dict:
+    def _prog(pct, msg):
+        if progress_cb:
+            progress_cb(min(max(float(pct or 0.0), 0.0), 1.0), msg)
+
+    output_dir = get_session_output_root(AUDIT_OUTPUT_FOLDER)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    package_name = f"audit_webfleet_rda_complete_{timestamp}.zip"
+    package_path = output_dir / package_name
+
+    _prog(0.02, "RDA cutting en cours...")
+    cutting = audit_run_rda_cutting(result)
+
+    _prog(0.08, "Génération des PDFs Gantt...")
+
+    def _main_pdf_progress(pct, msg=None):
+        _prog(0.08 + (float(pct or 0.0) * 0.52), msg or "Génération des PDFs Gantt...")
+
+    main_pdf_zip = audit_generate_pdfs(result, progress_cb=_main_pdf_progress, include_pairs=include_pairs, zip_prefix="PDF_Gantt/")
+
+    _prog(0.62, "Préparation du RDA cutting et des graphiques des jours modifiés...")
+
+    def _cutting_progress(pct, msg=None):
+        _prog(0.62 + (float(pct or 0.0) * 0.32), msg or "Préparation du RDA cutting...")
+
+    cutting_package = audit_build_rda_cutting_package(result, cutting, progress_cb=_cutting_progress, include_pairs=include_pairs)
+
+    _prog(0.95, "Assemblage du package final...")
+    package_buf = BytesIO()
+    with zipfile.ZipFile(package_buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        excel_bytes = result.get("excel_bytes")
+        if excel_bytes:
+            excel_bytes.seek(0)
+            excel_name = Path(result.get("excel_path", "audit_report.xlsx")).name
+            zf.writestr(f"Audit_Report/{excel_name}", excel_bytes.read())
+
+        if main_pdf_zip:
+            main_pdf_zip.seek(0)
+            with zipfile.ZipFile(main_pdf_zip, "r") as pdf_zf:
+                for info in pdf_zf.infolist():
+                    if not info.is_dir():
+                        zf.writestr(info.filename, pdf_zf.read(info.filename))
+
+        cutting_zip = cutting_package.get("zip_bytes") if cutting_package else None
+        if cutting_zip:
+            cutting_zip.seek(0)
+            with zipfile.ZipFile(cutting_zip, "r") as cut_zf:
+                for info in cut_zf.infolist():
+                    if not info.is_dir():
+                        zf.writestr(info.filename, cut_zf.read(info.filename))
+
+    package_buf.seek(0)
+    with open(package_path, "wb") as f:
+        f.write(package_buf.getvalue())
+    package_buf.seek(0)
+    _prog(1.0, "Package complet prêt.")
+
+    return {
+        "zip_bytes": package_buf,
+        "zip_path": package_path,
+        "download_name": package_name,
+        "output_mime": "application/zip",
+        "cutting": cutting,
+        "cutting_package": cutting_package,
+        "main_pdf_zip": main_pdf_zip,
     }
 
 
@@ -1560,6 +1734,71 @@ def audit_process(rda_file, wf_file, mapping_file, planning_file, progress_cb=No
             np.where(nr_label.str.len() > 0, "Client " + nr_label, ""),
         )
 
+    client_known_ids = audit_client_known_ids(map_sheets)
+    unmatched_parts = [
+        audit_unmatched_entity_summary(
+            rda[rda["collab_id"].isna()].copy(),
+            "Collaborateur",
+            "RDA",
+            "collab_no_sarl",
+            "collab_name",
+            "UNMATCHED",
+        ),
+        audit_unmatched_entity_summary(
+            wf[wf["collab_id"].isna()].copy(),
+            "Collaborateur",
+            "Webfleet",
+            "driverno",
+            "drivername",
+            "UNMATCHED",
+        ),
+        audit_unmatched_entity_summary(
+            planning[planning["collab_id"].isna()].copy(),
+            "Collaborateur",
+            "Planning",
+            "emp_nr",
+            None,
+            "UNMATCHED",
+        ),
+    ]
+    if client_known_ids:
+        rda_client_ids = rda["client_nr"].apply(audit_to_int_str) if "client_nr" in rda.columns else pd.Series(dtype=object)
+        planning_client_ids = planning["client_nr"].apply(audit_to_int_str) if "client_nr" in planning.columns else pd.Series(dtype=object)
+        if not rda_client_ids.empty:
+            unmatched_parts.append(
+                audit_unmatched_entity_summary(
+                    rda[
+                        rda_client_ids.astype(str).str.fullmatch(r"\d+", na=False)
+                        & ~rda_client_ids.astype(str).isin(client_known_ids)
+                    ].copy(),
+                    "Client",
+                    "RDA",
+                    "client_nr",
+                    "client_name",
+                    "UNMATCHED",
+                )
+            )
+        if not planning_client_ids.empty:
+            unmatched_parts.append(
+                audit_unmatched_entity_summary(
+                    planning[
+                        planning_client_ids.astype(str).str.fullmatch(r"\d+", na=False)
+                        & ~planning_client_ids.astype(str).isin(client_known_ids)
+                    ].copy(),
+                    "Client",
+                    "Planning",
+                    "client_nr",
+                    "client_name",
+                    "UNMATCHED",
+                )
+            )
+    unmatched_parts = [part for part in unmatched_parts if part is not None and not part.empty]
+    unmatched_mapping = (
+        audit_mapping_report_from_rows(pd.concat(unmatched_parts, ignore_index=True, sort=False).to_dict("records"))
+        if unmatched_parts
+        else pd.DataFrame(columns=audit_mapping_report_columns())
+    )
+
     overnight = planning["start"].notna() & planning["end"].notna() & (planning["end"] < planning["start"])
     planning.loc[overnight, "end"] = planning.loc[overnight, "end"] + pd.Timedelta(days=1)
     dur_missing = planning["duration_min"].isna() & planning["start"].notna() & planning["end"].notna()
@@ -1624,9 +1863,11 @@ def audit_process(rda_file, wf_file, mapping_file, planning_file, progress_cb=No
         main_blocks = audit_merge_blocks(grp, gap_min=AUDIT_INTERNAL_BLOCK_GAP_MIN)
         ibs = pd.NaT
         ibe = pd.NaT
+        second_block_start = pd.NaT
         if len(main_blocks) >= 2:
             raw_ibs = main_blocks[0][1]
             raw_ibe = main_blocks[1][0]
+            second_block_start = raw_ibe
             ibs = raw_ibs + pd.Timedelta(minutes=AUDIT_INTERNAL_BUFFER_MIN)
             ibe = raw_ibe - pd.Timedelta(minutes=AUDIT_INTERNAL_BUFFER_MIN)
             if pd.notna(ibs) and pd.notna(ibe) and ibe <= ibs:
@@ -1645,9 +1886,10 @@ def audit_process(rda_file, wf_file, mapping_file, planning_file, progress_cb=No
             "buffer_end": last_end + pd.Timedelta(minutes=AUDIT_WORK_END_BUFFER_MIN),
             "internal_buf_start": ibs,
             "internal_buf_end": ibe,
+            "second_block_start": second_block_start,
         })
     rda_daily = pd.DataFrame(rows_daily)
-    for col in ["rda_first_start", "rda_last_end", "buffer_start", "buffer_end", "internal_buf_start", "internal_buf_end"]:
+    for col in ["rda_first_start", "rda_last_end", "buffer_start", "buffer_end", "internal_buf_start", "internal_buf_end", "second_block_start"]:
         if col in rda_daily.columns:
             rda_daily[col] = audit_align_to_zurich(rda_daily[col])
 
@@ -1655,7 +1897,7 @@ def audit_process(rda_file, wf_file, mapping_file, planning_file, progress_cb=No
 
     wf = wf.copy()
     wf["collab_id"] = wf["collab_id"].astype(str)
-    merge_cols = ["rda_first_start", "rda_last_end", "buffer_start", "buffer_end", "internal_buf_start", "internal_buf_end", "day_class"]
+    merge_cols = ["rda_first_start", "rda_last_end", "buffer_start", "buffer_end", "internal_buf_start", "internal_buf_end", "second_block_start", "day_class"]
     wf = wf.drop(columns=[c for c in merge_cols if c in wf.columns], errors="ignore")
     if not rda_daily.empty:
         wf = wf.merge(rda_daily[["collab_id", "date"] + merge_cols], how="left", on=["collab_id", "date"])
@@ -1693,6 +1935,27 @@ def audit_process(rda_file, wf_file, mapping_file, planning_file, progress_cb=No
         _interval_overlap(s, e, ibs, ibe)
         for s, e, ibs, ibe in zip(wf["start"], wf["end"], wf["internal_buf_start"], wf["internal_buf_end"])
     ]
+    wf["second_shift_approach_exempt"] = False
+    if not wf.empty and "second_block_start" in wf.columns:
+        for _, grp_idx in wf.groupby(["collab_id", "date"], sort=False).groups.items():
+            grp = wf.loc[list(grp_idx)]
+            second_start_vals = grp["second_block_start"].dropna()
+            if second_start_vals.empty:
+                continue
+            second_start = second_start_vals.iloc[0]
+            arrival_window_start = second_start - pd.Timedelta(minutes=AUDIT_INTERNAL_BUFFER_MIN)
+            candidates = grp[
+                grp["tripmode"].isin([2, 3])
+                & grp["start"].notna()
+                & grp["end"].notna()
+                & (grp["start"] <= second_start)
+                & (grp["end"] >= arrival_window_start)
+            ].copy()
+            if candidates.empty:
+                continue
+            candidates["_end_delta_abs"] = (candidates["end"] - second_start).abs()
+            candidates = candidates.sort_values(["_end_delta_abs", "end", "start"], ascending=[True, False, False])
+            wf.at[candidates.index[0], "second_shift_approach_exempt"] = True
 
     def _build_flags(row):
         km = float(row["km"]) if pd.notna(row["km"]) else 0.0
@@ -1706,7 +1969,9 @@ def audit_process(rda_file, wf_file, mapping_file, planning_file, progress_cb=No
             f.append("NO_RDA_BUT_MODE23")
         if row["before_shift"] and row["tripmode"] in [2, 3] and km >= AUDIT_KM_MIN_FOR_FLAG_CONTEXT:
             f.append("PRE_SHIFT_MODE2")
-        if row["in_internal_buffer"] and row["tripmode"] in [2, 3] and km >= AUDIT_KM_MIN_FOR_FLAG_CONTEXT:
+        if row["second_shift_approach_exempt"] and row["tripmode"] in [2, 3] and km >= AUDIT_KM_MIN_FOR_FLAG_CONTEXT:
+            f.append("APPROACH_SECOND_SHIFT_EXEMPT")
+        if row["in_internal_buffer"] and not row["second_shift_approach_exempt"] and row["tripmode"] in [2, 3] and km >= AUDIT_KM_MIN_FOR_FLAG_CONTEXT:
             f.append("MODE23_IN_INTERNAL_BUFFER")
         if pd.isna(row["collab_id"]) or row["collab_id"] in ("None", "nan"):
             f.append("UNMAPPED_DRIVER")
@@ -1720,7 +1985,7 @@ def audit_process(rda_file, wf_file, mapping_file, planning_file, progress_cb=No
 
     wf["flags"] = wf.apply(_build_flags, axis=1)
     wf["suspect_private_km"] = np.where(
-        wf["tripmode"].isin([2, 3]) & (wf["after_buffer"] | wf["offday"] | wf["before_shift"] | wf["in_internal_buffer"]),
+        wf["tripmode"].isin([2, 3]) & (~wf["second_shift_approach_exempt"]) & (wf["after_buffer"] | wf["offday"] | wf["before_shift"] | wf["in_internal_buffer"]),
         wf["km"].fillna(0.0),
         0.0,
     )
@@ -2010,6 +2275,7 @@ def audit_process(rda_file, wf_file, mapping_file, planning_file, progress_cb=No
         if not rda_daily.empty:
             audit_drop_tz_excel_safe(rda_daily).to_excel(xw, index=False, sheet_name="RDA_Daily")
         map_df.to_excel(xw, index=False, sheet_name="Mapping")
+        unmatched_mapping.to_excel(xw, index=False, sheet_name="Unmatched_Mapping")
         flag_summary.to_excel(xw, index=False, sheet_name="Flag_Summary")
         audit_drop_tz_excel_safe(planning).to_excel(xw, index=False, sheet_name="Planning")
         if AUDIT_ENABLE_61010_FEATURE and not prestation61010_checks.empty:
@@ -2037,6 +2303,7 @@ def audit_process(rda_file, wf_file, mapping_file, planning_file, progress_cb=No
         "rda_daily": rda_daily,
         "agg_daily": agg_daily,
         "collab_stats": collab_stats,
+        "unmatched_mapping": unmatched_mapping,
         "daily_usage": daily_usage,
         "flag_summary": flag_summary,
         "prestation61010_checks": prestation61010_checks,
@@ -2051,6 +2318,8 @@ def audit_process(rda_file, wf_file, mapping_file, planning_file, progress_cb=No
             "total_collabs": wf["collab_id"].nunique(),
             "flagged_trip_pct": flagged_pct,
             "suspect_km_total": suspect_km,
+            "unmatched_mapping_rows": int(unmatched_mapping["Row Count"].sum()) if not unmatched_mapping.empty else 0,
+            "unmatched_mapping_entities": int(len(unmatched_mapping)) if not unmatched_mapping.empty else 0,
         },
     }
 
@@ -2546,6 +2815,26 @@ def audit_build_day_fig(data_ctx: dict, result: dict, cid: str, date_str: str):
         _draw_lane_box(fig, [0.300, 0.785, 0.195, 0.095], "PLANNING COLORS", plan_items, fs=8.2)
         _draw_lane_box(fig, [0.505, 0.785, 0.210, 0.095], "PRESTATION INDEX", prest_items, fs=8.2)
 
+    def _draw_wf_mode_index(fig):
+        items = [
+            ("M1 Private", "#6c757d"),
+            ("M2 Professional", "#ff7f0e"),
+            ("M3 Commute", "#1f77b4"),
+            ("Suspected Private", "#d62728"),
+        ]
+        ax_leg = fig.add_axes([0.290, 0.035, 0.340, 0.045])
+        ax_leg.set_axis_off()
+        ax_leg.text(0.0, 0.66, "WEBFLEET MODES", transform=ax_leg.transAxes,
+                    ha="left", va="center", fontsize=8.8, fontweight="bold", color="#222222")
+        x = 0.245
+        for label, color in items:
+            ax_leg.add_patch(mpatches.Rectangle((x, 0.44), 0.030, 0.30,
+                                                transform=ax_leg.transAxes,
+                                                facecolor=color, edgecolor="#333333", linewidth=0.5))
+            ax_leg.text(x + 0.038, 0.66, label, transform=ax_leg.transAxes,
+                        ha="left", va="center", fontsize=8.5, color="#222222")
+            x += 0.185 if label != "Suspected Private" else 0.230
+
     def _draw_lane_box(fig, rect, title, items, fs=6.5):
         if not items:
             return
@@ -2612,41 +2901,60 @@ def audit_build_day_fig(data_ctx: dict, result: dict, cid: str, date_str: str):
                  family="monospace", color="#222222",
                  bbox=dict(facecolor="#ffffff", edgecolor="#cfcfcf", boxstyle="round,pad=0.38", alpha=0.96))
 
+    def _event_visual_bounds(day_events):
+        if day_events.empty:
+            return pd.NaT, pd.NaT
+        starts = []
+        ends = []
+        for _, row in day_events.iterrows():
+            left = _to_ln(row.get("left", pd.NaT))
+            right = _to_ln(row.get("right", pd.NaT))
+            ghost_left = _to_ln(row.get("ghost_left", pd.NaT))
+            ghost_right = _to_ln(row.get("ghost_right", pd.NaT))
+            if pd.notna(ghost_left):
+                starts.append(ghost_left)
+            if pd.notna(left):
+                starts.append(left)
+            if pd.notna(ghost_right):
+                ends.append(ghost_right)
+            if pd.notna(right):
+                ends.append(right)
+        if not starts or not ends:
+            return pd.NaT, pd.NaT
+        left = min(starts)
+        right = max(ends)
+        return (left, right) if right > left else (pd.NaT, pd.NaT)
+
     def _day_bounds(day_events, day_str, min_hours=16):
         if day_events.empty:
             base = pd.Timestamp(f"{day_str} 00:00:00")
             return base, base + pd.Timedelta(hours=min_hours)
-        left = _to_ln(day_events["left"].min())
-        right = _to_ln(day_events["right"].max())
+        left, right = _event_visual_bounds(day_events)
         if pd.isna(left) or pd.isna(right) or right <= left:
             base = pd.Timestamp(f"{day_str} 00:00:00")
             return base, base + pd.Timedelta(hours=min_hours)
+        left = pd.Timestamp(left).floor("h")
+        right = pd.Timestamp(right).ceil("h")
         if (right - left) < pd.Timedelta(hours=min_hours):
             right = left + pd.Timedelta(hours=min_hours)
         return left, right
 
     def _lane_span(day_events, kind):
         sub = day_events[day_events["kind"] == kind]
-        if kind == "RDA_ORIG" and "is_removed" in sub.columns:
-            active = sub[~sub["is_removed"].apply(audit_truthy_flag)]
-            if not active.empty:
-                sub = active
         if sub.empty:
             return pd.NaT, pd.NaT
-        s = _to_ln(sub["left"].min())
-        e = _to_ln(sub["right"].max())
+        if kind == "RDA_ORIG":
+            s, e = _event_visual_bounds(sub)
+        else:
+            s = _to_ln(sub["left"].min())
+            e = _to_ln(sub["right"].max())
         return (s, e) if (pd.notna(s) and pd.notna(e) and e > s) else (pd.NaT, pd.NaT)
 
     def _draw_markers(ax, day_events):
         sub = day_events[day_events["kind"] == "RDA_ORIG"]
-        if "is_removed" in sub.columns:
-            active = sub[~sub["is_removed"].apply(audit_truthy_flag)]
-            if not active.empty:
-                sub = active
         if sub.empty:
             return
-        rs = _to_ln(sub["left"].min())
-        re_ = _to_ln(sub["right"].max())
+        rs, re_ = _event_visual_bounds(sub)
         if pd.isna(rs) or pd.isna(re_) or re_ <= rs:
             return
         ymin, ymax = -0.36, 2.36
@@ -2771,7 +3079,7 @@ def audit_build_day_fig(data_ctx: dict, result: dict, cid: str, date_str: str):
     km_line = (f"Month KM ({km_stats['month_label']})    |    Private: {km_stats['km_private']:.1f}km"
                f"    |    Suspect: {km_stats['km_suspect_private']:.1f}km"
                f"    |    Private+Suspect: {km_stats['km_private_plus_suspect']:.1f}km"
-               f"    |    Dom-travail: {km_stats['km_commute']:.1f}km"
+               f"    |    Commute: {km_stats['km_commute']:.1f}km"
                f"    |    Professionnel: {km_stats['km_professional']:.1f}km"
                f"    |    Total: {km_stats['km_total']:.1f}km")
     wf_all_text = _wf_all_text(day_events)
@@ -2792,7 +3100,7 @@ def audit_build_day_fig(data_ctx: dict, result: dict, cid: str, date_str: str):
     ax.set_ylim(-0.52, 2.72)
     ax.margins(x=0, y=0)
     ax.set_yticks([0.0, 1.0, 2.0])
-    ax.set_yticklabels(["WF", "RDA", "Plan"], fontsize=11.5)
+    ax.set_yticklabels(["WF", "RDA", "Planning"], fontsize=11.5)
     span_hours = max(1.0, (right_bound - left_bound).total_seconds() / 3600.0)
     major_interval = 1 if span_hours <= 14 else 2 if span_hours <= 22 else 3
     ax.xaxis.set_major_locator(mdates.HourLocator(interval=major_interval))
@@ -2817,6 +3125,7 @@ def audit_build_day_fig(data_ctx: dict, result: dict, cid: str, date_str: str):
     fig.text(0.838, 0.875, next_rest_text, ha="right", va="top", fontsize=8.7, family="monospace", color="#222222",
              bbox=dict(facecolor="#ffffff", edgecolor="#cfcfcf", boxstyle="round,pad=0.35", alpha=0.96))
     _draw_right_index(fig, day_events, wf_all_text, rda_all_text)
+    _draw_wf_mode_index(fig)
     fig.subplots_adjust(left=0.065, right=0.855, top=0.72, bottom=0.12)
     return fig
 
@@ -2877,7 +3186,7 @@ def audit_generate_pdfs(result: dict, progress_cb=None, include_pairs: set[tuple
                     fig = audit_build_day_fig(data_ctx, result, str(rr["collab_id"]), str(rr["date_str"]))
                     if fig is None:
                         continue
-                    pdf.savefig(fig, dpi=180, bbox_inches="tight")
+                    pdf.savefig(fig, dpi=180)
                     plt.close(fig)
                     pages_written += 1
             _prog(idx + 1, collab_label, pages=pages_written)
@@ -2888,7 +3197,7 @@ def audit_generate_pdfs(result: dict, progress_cb=None, include_pairs: set[tuple
     return zip_buf
 
 
-def audit_pdf_worker(result: dict, status: dict):
+def audit_pdf_worker(result: dict, status: dict, include_pairs: set[tuple[str, str]] | None = None):
     def _progress(pct, text=None):
         status["progress"] = float(pct)
         if text:
@@ -2896,7 +3205,7 @@ def audit_pdf_worker(result: dict, status: dict):
 
     status.update({"state": "running", "progress": 0.0, "text": "Initialisation des PDFs...", "error": None})
     try:
-        zip_bytes = audit_generate_pdfs(result, progress_cb=_progress)
+        zip_bytes = audit_generate_pdfs(result, progress_cb=_progress, include_pairs=include_pairs)
         if zip_bytes is None:
             status.update({"state": "empty", "progress": 1.0, "text": "Aucune donnée à exporter en PDF."})
         else:
@@ -2907,7 +3216,7 @@ def audit_pdf_worker(result: dict, status: dict):
         raise
 
 
-def audit_start_pdf_job(result: dict, force: bool = False) -> None:
+def audit_start_pdf_job(result: dict, force: bool = False, include_pairs: set[tuple[str, str]] | None = None) -> None:
     future = st.session_state.get("latest_audit_pdf_future")
     if future is not None and not future.done() and not force:
         return
@@ -2922,7 +3231,7 @@ def audit_start_pdf_job(result: dict, force: bool = False) -> None:
 
     status = {"state": "queued", "progress": 0.0, "text": "PDFs Gantt en attente...", "error": None}
     st.session_state["latest_audit_pdf_status"] = status
-    st.session_state["latest_audit_pdf_future"] = executor.submit(audit_pdf_worker, result, status)
+    st.session_state["latest_audit_pdf_future"] = executor.submit(audit_pdf_worker, result, status, include_pairs)
 
 
 def audit_collect_pdf_job() -> None:
@@ -2944,12 +3253,15 @@ def audit_collect_pdf_job() -> None:
 
 def audit_render_pdf_controls(result: dict) -> None:
     audit_collect_pdf_job()
+    complete_package = st.session_state.get("latest_audit_complete_package")
     status = st.session_state.get("latest_audit_pdf_status")
     future = st.session_state.get("latest_audit_pdf_future")
 
     p1, p2 = st.columns([2, 1])
     with p1:
-        if status:
+        if complete_package:
+            st.success("PDFs Gantt, RDA cutting et rapport Excel sont dans le package complet.")
+        elif status:
             state = status.get("state", "queued")
             text = status.get("text", "PDFs Gantt en cours...")
             pct = float(status.get("progress", 0.0) or 0.0)
@@ -2963,19 +3275,31 @@ def audit_render_pdf_controls(result: dict) -> None:
             elif state == "error":
                 st.error(text)
         else:
-            st.caption("Les PDFs Gantt démarrent automatiquement après l'audit.")
+            st.caption("Les PDFs Gantt sont générés pendant l'audit complet.")
     with p2:
-        if st.button("Relancer les PDFs", key="audit_gen_pdf", use_container_width=True):
-            audit_start_pdf_job(result, force=True)
-            st.rerun()
-        pdf_zip = st.session_state.get("latest_audit_pdf_zip")
-        if pdf_zip:
-            pdf_zip.seek(0)
+        if complete_package and complete_package.get("zip_bytes"):
+            zip_bytes = complete_package["zip_bytes"]
+            zip_bytes.seek(0)
             st.download_button(
-                "Télécharger les PDFs (zip)", pdf_zip,
-                file_name="audit_pdfs_gantt.zip", mime="application/zip",
+                "Télécharger package complet",
+                zip_bytes,
+                file_name=complete_package.get("download_name", "audit_webfleet_rda_complete.zip"),
+                mime=complete_package.get("output_mime", "application/zip"),
+                key="audit_complete_package_dashboard_download",
                 use_container_width=True,
             )
+        else:
+            if st.button("Relancer les PDFs", key="audit_gen_pdf", use_container_width=True):
+                audit_start_pdf_job(result, force=True, include_pairs=st.session_state.get("latest_audit_pdf_include_pairs"))
+                st.rerun()
+            pdf_zip = st.session_state.get("latest_audit_pdf_zip")
+            if pdf_zip:
+                pdf_zip.seek(0)
+                st.download_button(
+                    "Télécharger les PDFs (zip)", pdf_zip,
+                    file_name="audit_pdfs_gantt.zip", mime="application/zip",
+                    use_container_width=True,
+                )
 
 
 @st.fragment(run_every="2s")
@@ -3229,13 +3553,15 @@ def render_audit_dashboard(result: dict) -> None:
     daily_usage = result["daily_usage"]
     agg_daily = result["agg_daily"]
     wf_df = result["wf"]
+    unmatched_mapping = result.get("unmatched_mapping", pd.DataFrame(columns=audit_mapping_report_columns()))
 
     # --- Metrics row ---
-    m_cols = st.columns(4)
+    m_cols = st.columns(5)
     m_cols[0].metric("Trajets WF total", f"{metrics['total_trips']:,}")
     m_cols[1].metric("Collaborateurs", f"{metrics['total_collabs']:,}")
     m_cols[2].metric("% Trajets flaggés", f"{metrics['flagged_trip_pct']:.1f}%")
     m_cols[3].metric("KM suspects total", f"{metrics['suspect_km_total']:,.1f} km")
+    m_cols[4].metric("Mapping non reconnu", f"{metrics.get('unmatched_mapping_rows', 0):,}")
 
     st.divider()
 
@@ -3290,7 +3616,7 @@ def render_audit_dashboard(result: dict) -> None:
                         fig = audit_build_day_fig(chart_data, result, sel_cid, sel_date)
                         if fig:
                             img_buf = BytesIO()
-                            fig.savefig(img_buf, format="png", dpi=120, bbox_inches="tight")
+                            fig.savefig(img_buf, format="png", dpi=120)
                             plt.close(fig)
                             img_buf.seek(0)
                             st.session_state["audit_gantt_img"] = {
@@ -3397,7 +3723,7 @@ def render_audit_dashboard(result: dict) -> None:
             )
 
     # --- Data tabs ---
-    tab_names = ["Résumé Collaborateurs", "Agrégats Journaliers", "Tous les Trajets", "Entrées RDA", "Planning"]
+    tab_names = ["Résumé Collaborateurs", "Agrégats Journaliers", "Tous les Trajets", "Entrées RDA", "Planning", "Non reconnus"]
     tabs = st.tabs(tab_names)
 
     with tabs[0]:
@@ -3486,6 +3812,20 @@ def render_audit_dashboard(result: dict) -> None:
         st.caption(f"{len(plan_f):,} entrées")
         st.dataframe(audit_drop_tz_excel_safe(plan_f), use_container_width=True, hide_index=True)
 
+    with tabs[5]:
+        collaborator_mapping = unmatched_mapping[
+            unmatched_mapping.get("Entity Type", pd.Series(dtype=object)).astype(str).eq("Collaborateur")
+        ].copy() if not unmatched_mapping.empty else pd.DataFrame(columns=audit_mapping_report_columns())
+        client_mapping = unmatched_mapping[
+            unmatched_mapping.get("Entity Type", pd.Series(dtype=object)).astype(str).eq("Client")
+        ].copy() if not unmatched_mapping.empty else pd.DataFrame(columns=audit_mapping_report_columns())
+
+        st.subheader("Collaborateurs non reconnus")
+        st.dataframe(collaborator_mapping, width="stretch", hide_index=True)
+
+        st.subheader("Clients non reconnus")
+        st.dataframe(client_mapping, width="stretch", hide_index=True)
+
 
 # ============================================================
 # Audit — task entry point
@@ -3501,44 +3841,106 @@ def render_audit_task() -> None:
     mapping_file = upload_cols[2].file_uploader("Fichier Mapping", type=["xlsx", "xls"], key="audit_map")
     planning_file = upload_cols[3].file_uploader("Fichier Planning", type=["xlsx", "xls"], key="audit_plan")
 
+    option_cols = st.columns([1.2, 2.8])
+    choose_specific_dates = option_cols[0].checkbox("Choisir des dates spécifiques", key="audit_choose_pdf_dates")
+    pdf_date_range = None
+    if choose_specific_dates:
+        previous_monday, previous_sunday = audit_previous_full_week()
+        pdf_date_range = option_cols[1].date_input(
+            "Dates à inclure dans les PDFs",
+            value=(previous_monday, previous_sunday),
+            key="audit_pdf_date_range",
+        )
+
     all_uploaded = all([rda_file, wf_file, mapping_file, planning_file])
 
     result = st.session_state.get("latest_audit_result")
-    excel_path = result["excel_path"] if result else None
+    complete_package = st.session_state.get("latest_audit_complete_package")
 
     action_cols = st.columns([2, 1])
     with action_cols[0]:
-        run_audit = st.button("Lancer l'audit", type="primary", disabled=not all_uploaded, width="stretch")
+        invalid_pdf_dates = (
+            choose_specific_dates
+            and (not isinstance(pdf_date_range, (tuple, list)) or len(pdf_date_range) != 2 or pdf_date_range[0] > pdf_date_range[1])
+        )
+        run_audit = st.button("Lancer l'audit", type="primary", disabled=not all_uploaded or invalid_pdf_dates, width="stretch")
+
+    if invalid_pdf_dates:
+        st.error("La plage de dates PDF doit contenir une date de début et une date de fin valides.")
 
     if run_audit:
         render_blocking_run_warning()
-        progress = st.progress(0.0, text="Démarrage de l'audit...")
+        progress = st.progress(0.0, text="Démarrage de l'audit complet...")
         try:
-            result = audit_process(rda_file, wf_file, mapping_file, planning_file, progress_cb=progress.progress)
-            progress.progress(1.0, text="Audit terminé")
+            def _audit_progress(pct, msg=None):
+                progress.progress(
+                    min(max(float(pct or 0.0) * 0.45, 0.0), 0.45),
+                    text=msg or "Audit en cours...",
+                )
+
+            result = audit_process(rda_file, wf_file, mapping_file, planning_file, progress_cb=_audit_progress)
+            pdf_include_pairs = None
+            if choose_specific_dates:
+                pdf_start, pdf_end = pdf_date_range
+                pdf_include_pairs = audit_pdf_pairs_for_date_range(result, pdf_start, pdf_end)
+                st.session_state["latest_audit_pdf_include_pairs"] = pdf_include_pairs
+                st.session_state["latest_audit_pdf_date_range"] = (pdf_start.isoformat(), pdf_end.isoformat())
+                if not pdf_include_pairs:
+                    st.warning("Aucune journée PDF trouvée dans la plage de dates sélectionnée.")
+            else:
+                st.session_state.pop("latest_audit_pdf_include_pairs", None)
+                st.session_state.pop("latest_audit_pdf_date_range", None)
             st.session_state["latest_audit_result"] = result
             st.session_state.pop("latest_audit_pdf_zip", None)
             st.session_state.pop("latest_audit_pdf_future", None)
             st.session_state.pop("latest_audit_pdf_status", None)
+            st.session_state.pop("latest_audit_complete_package", None)
             st.session_state.pop("latest_audit_chart_data", None)
             st.session_state.pop("audit_gantt_img", None)
             st.session_state.pop("latest_rda_cutting_result", None)
             st.session_state.pop("latest_rda_cutting_pdf_zip", None)
+            st.session_state.pop("latest_rda_cutting_package", None)
             st.session_state.pop("latest_rda_manual_review_result", None)
             st.session_state.pop("latest_rda_manual_review_pdf_zip", None)
-            audit_start_pdf_job(result)
+
+            def _package_progress(pct, msg=None):
+                progress.progress(
+                    min(max(0.45 + (float(pct or 0.0) * 0.55), 0.45), 1.0),
+                    text=msg or "Génération du package complet...",
+                )
+
+            complete_package = audit_build_complete_package(result, progress_cb=_package_progress, include_pairs=pdf_include_pairs)
+            st.session_state["latest_audit_complete_package"] = complete_package
+            st.session_state["latest_rda_cutting_result"] = complete_package.get("cutting")
+            st.session_state["latest_rda_cutting_package"] = complete_package.get("cutting_package")
+            progress.progress(1.0, text="Audit complet terminé.")
         except Exception as exc:
             progress.empty()
             st.exception(exc)
             return
 
     result = st.session_state.get("latest_audit_result")
-    excel_path = result["excel_path"] if result else None
+    complete_package = st.session_state.get("latest_audit_complete_package")
     with action_cols[1]:
-        render_download_or_placeholder(excel_path, "Télécharger le rapport Excel", key="audit_main_excel")
+        if complete_package and complete_package.get("zip_bytes"):
+            zip_bytes = complete_package["zip_bytes"]
+            zip_bytes.seek(0)
+            st.download_button(
+                "Télécharger le package complet",
+                zip_bytes,
+                file_name=complete_package.get("download_name", "audit_webfleet_rda_complete.zip"),
+                mime=complete_package.get("output_mime", "application/zip"),
+                key="audit_complete_package_download",
+                width="stretch",
+            )
+        else:
+            st.button("Télécharger le package complet", disabled=True, key="audit_complete_package_placeholder", width="stretch")
 
     if result:
-        st.success("Rapport Excel créé et disponible au téléchargement.")
+        if complete_package:
+            st.success("Audit, PDFs Gantt et RDA cutting terminés. Le package complet est disponible au téléchargement.")
+        else:
+            st.success("Rapport Excel créé.")
         render_audit_dashboard(result)
 
 
