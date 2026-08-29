@@ -41,6 +41,16 @@ def audit_clean_legend_text(x):
     return "" if s.lower() in {"nan", "nat", "none", "<na>"} else s
 
 
+def audit_darken_hex_color(color: str, factor: float = 0.72) -> str:
+    """Return a darker shade of a six-digit hex color."""
+    color = str(color).strip()
+    if not re.fullmatch(r"#[0-9a-fA-F]{6}", color):
+        return color
+    factor = min(1.0, max(0.0, float(factor)))
+    channels = (int(color[i:i + 2], 16) for i in (1, 3, 5))
+    return "#" + "".join(f"{round(channel * factor):02x}" for channel in channels)
+
+
 def audit_clean_report_text(value) -> str:
     if value is None:
         return ""
@@ -2426,14 +2436,18 @@ def audit_build_chart_data(result: dict):
             tm = int(rr.tripmode)
         except Exception:
             tm = -1
+        duration_mins = audit_duration_mins(s, e)
+        is_long_trip = pd.notna(duration_mins) and duration_mins > 30
         fill_c = "#d62728" if is_suspect else {1: "#6c757d", 2: "#ff7f0e", 3: "#1f77b4"}.get(tm, "#999999")
+        if is_long_trip and tm != 1:
+            fill_c = audit_darken_hex_color(fill_c)
         km_txt = f"{float(rr.km):.1f}km" if hasattr(rr, "km") and pd.notna(rr.km) else ""
         rows_ev.append({
             "collab_id": cid, "collab_label": collab_labels.get(cid, cid), "date_str": date_str,
             "kind": "WF", "y": LANE_Y["WF"], "left": s, "right": e, "mid": s + (e - s) / 2, "height": 0.34,
             "fill_color": fill_c, "line_color": "#7f0000" if is_suspect else "#202020",
-            "line_width": 1.0,
-            "label_text": f"{int(round(audit_duration_mins(s, e)))}m", "label_y": -0.20, "label_color": "#222222",
+            "line_width": 1.0, "line_style": "--" if is_long_trip and tm != 1 else "-",
+            "label_text": f"{int(round(duration_mins))}m", "label_y": -0.20, "label_color": "#222222",
             "km_label": km_txt, "km_label_y": -0.38 if ((wf_idx - 1) % 2 == 0) else -0.48,
             "km_label_color": "#d62728" if is_suspect else "#111111", "wf_index": wf_idx,
             "tripmode": tm if tm in [1, 2, 3] else "",
@@ -2659,7 +2673,11 @@ def audit_build_day_fig(data_ctx: dict, result: dict, cid: str, date_str: str):
             mins = audit_duration_mins(row["left"], row["right"])
             mins_txt = f"{int(round(mins))}m" if pd.notna(mins) else "-"
             code_txt = audit_clean_legend_text(row.get("prestation_code", "")) or "-"
-            lines.append(f"{idx_txt}. {code_txt} | {s} → {e} ({mins_txt})")
+            client_nr = audit_clean_legend_text(row.get("client_nr", ""))
+            client_digits = re.sub(r"\D", "", client_nr)
+            client_txt = client_digits[-4:] if client_digits else "-"
+            client_suffix = rf"$\mathbf{{{client_txt}}}$" if client_digits else client_txt
+            lines.append(f"{idx_txt}. {code_txt} | {s} → {e} ({mins_txt})|{client_suffix}")
         return "ALL RDA PRESTATIONS\n" + "\n".join(lines)
 
     def _legend_items(day_events):
@@ -2963,8 +2981,17 @@ def audit_build_day_fig(data_ctx: dict, result: dict, cid: str, date_str: str):
             ax.vlines(xx, ymin=ymin, ymax=ymax, colors="#555555", linestyles="--", linewidth=2.0, alpha=0.90, zorder=1)
             ax.text(xx, 2.52, lab, ha="center", va="bottom", fontsize=11.5, color="#555555", zorder=6, clip_on=False)
         span_hours = max(0.0, (re_ - rs).total_seconds() / 3600.0)
-        for h in range(1, int(math.floor(span_hours)) + 2):
-            x = rs + pd.Timedelta(hours=h)
+        marker_origin = rs
+        marker_hours = range(1, int(math.floor(span_hours)) + 2)
+        for h in marker_hours:
+            # Draw only the midpoint between consecutive hour markers. Both marker
+            # types share marker_origin, so no half-hour line can overlap a full hour.
+            half_x = marker_origin + pd.Timedelta(minutes=(h * 60) - 30)
+            ax.vlines(
+                mdates.date2num(half_x), ymin=ymin, ymax=ymax, colors="#c0c0c0",
+                linestyles=":", linewidth=0.8, alpha=0.65, zorder=1,
+            )
+            x = marker_origin + pd.Timedelta(hours=h)
             xx = mdates.date2num(x)
             ax.vlines(xx, ymin=ymin, ymax=ymax, colors="#9a9a9a", linestyles=":", linewidth=1.2, alpha=0.80, zorder=1)
             ax.text(xx, 2.45, f"{h}h", ha="center", va="bottom", fontsize=10, color="#6f6f6f", zorder=6, clip_on=False)
@@ -3013,7 +3040,9 @@ def audit_build_day_fig(data_ctx: dict, result: dict, cid: str, date_str: str):
                     [(mdates.date2num(left), mdates.date2num(right) - mdates.date2num(left))],
                     (y - h / 2.0, h),
                     facecolors=rr["fill_color"], edgecolors=rr["line_color"],
-                    linewidth=float(rr.get("line_width", 1.0) or 1.0), alpha=0.95, zorder=3,
+                    linewidth=float(rr.get("line_width", 1.0) or 1.0),
+                    linestyle=rr["line_style"] if isinstance(rr.get("line_style"), str) else "-",
+                    alpha=0.95, zorder=3,
                 )
             mid = _to_ln(rr["mid"])
             if is_removed and pd.notna(ghost_left) and pd.notna(ghost_right):
@@ -3101,12 +3130,13 @@ def audit_build_day_fig(data_ctx: dict, result: dict, cid: str, date_str: str):
     ax.margins(x=0, y=0)
     ax.set_yticks([0.0, 1.0, 2.0])
     ax.set_yticklabels(["WF", "RDA", "Planning"], fontsize=11.5)
-    span_hours = max(1.0, (right_bound - left_bound).total_seconds() / 3600.0)
-    major_interval = 1 if span_hours <= 14 else 2 if span_hours <= 22 else 3
-    ax.xaxis.set_major_locator(mdates.HourLocator(interval=major_interval))
+    ax.xaxis.set_major_locator(mdates.HourLocator(interval=1))
     ax.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M"))
-    ax.tick_params(axis="x", labelsize=11)
-    ax.grid(axis="x", linestyle=":", linewidth=0.8, alpha=0.45)
+    ax.tick_params(
+        axis="x", labelsize=11, bottom=True, labelbottom=True,
+        top=False, labeltop=False,
+    )
+    ax.grid(axis="x", visible=False)
     ax.grid(axis="y", visible=False)
     for sp in ax.spines.values():
         sp.set_linewidth(0.8)
