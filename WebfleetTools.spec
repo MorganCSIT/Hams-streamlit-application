@@ -1,7 +1,10 @@
 # -*- mode: python ; coding: utf-8 -*-
+from pathlib import Path
+
 from PyInstaller.utils.hooks import collect_all
 
-datas = [('app.py', '.'), ('app_config.py', '.'), ('audit_webfleet_rda.py', '.'), ('ltr_checks.py', '.'), ('merge_files.py', '.'), ('nexus_batch_runner.py', '.'), ('planning_download.py', '.'), ('rda_transfers.py', '.'), ('ui_common.py', '.'), ('webfleet.py', '.'), ('company colors.png', '.'), ('feedback.png', '.'), ('.streamlit', '.streamlit'), ('Scripts', 'Scripts'), ('Templates', 'Templates')]
+data_candidates = [('app.py', '.'), ('app_config.py', '.'), ('audit_webfleet_rda.py', '.'), ('ltr_checks.py', '.'), ('merge_files.py', '.'), ('nexus_batch_runner.py', '.'), ('planning_download.py', '.'), ('rda_transfers.py', '.'), ('ui_common.py', '.'), ('webfleet.py', '.'), ('company colors.png', '.'), ('feedback.png', '.'), ('.streamlit', '.streamlit'), ('Scripts', 'Scripts'), ('Templates', 'Templates')]
+datas = [(source, destination) for source, destination in data_candidates if Path(source).exists()]
 binaries = []
 hiddenimports = []
 tmp_ret = collect_all('streamlit')
