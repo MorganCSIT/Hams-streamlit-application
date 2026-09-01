@@ -3591,7 +3591,7 @@ def render_audit_dashboard(result: dict) -> None:
     m_cols[1].metric("Collaborateurs", f"{metrics['total_collabs']:,}")
     m_cols[2].metric("% Trajets flaggés", f"{metrics['flagged_trip_pct']:.1f}%")
     m_cols[3].metric("KM suspects total", f"{metrics['suspect_km_total']:,.1f} km")
-    m_cols[4].metric("Mapping non reconnu", f"{metrics.get('unmatched_mapping_rows', 0):,}")
+    m_cols[4].metric("Lignes avec mapping non reconnu", f"{metrics.get('unmatched_mapping_rows', 0):,}")
 
     st.divider()
 
