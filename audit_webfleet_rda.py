@@ -1,5 +1,6 @@
 from app_config import *
 import concurrent.futures
+import hashlib
 
 from ui_common import read_csv_flex, render_blocking_run_warning
 
@@ -333,6 +334,23 @@ def audit_safe_filename(x):
     s = re.sub(r"[^\w\-. ]+", "_", s)
     s = re.sub(r"\s+", "_", s)
     return s[:180] if s else "collaborateur"
+
+
+def audit_pdf_filename(collab_label, collab_id, max_length: int = 60) -> str:
+    """Return a short, unique and filesystem-safe collaborator PDF name."""
+    extension = ".pdf"
+    id_marker = "__id_"
+    safe_name = audit_safe_filename(collab_label)
+    safe_id = audit_safe_filename(collab_id)
+
+    max_id_length = max_length - len(id_marker) - len(extension) - 1
+    if len(safe_id) > max_id_length:
+        digest = hashlib.sha256(safe_id.encode("utf-8")).hexdigest()[:8]
+        safe_id = f"{safe_id[:max_id_length - len(digest) - 1]}_{digest}"
+
+    name_length = max_length - len(id_marker) - len(safe_id) - len(extension)
+    safe_name = safe_name[:max(1, name_length)]
+    return f"{safe_name}{id_marker}{safe_id}{extension}"
 
 
 def audit_join_ids(values):
@@ -3207,7 +3225,7 @@ def audit_generate_pdfs(result: dict, progress_cb=None, include_pairs: set[tuple
             grp = grp.sort_values("date_str").reset_index(drop=True)
             cid_values = grp["collab_id"].dropna().astype(str).unique().tolist()
             cid = cid_values[0] if cid_values else "unknown"
-            pdf_name = f"{audit_safe_filename(collab_label)}__id_{audit_safe_filename(cid)}__wf_rda_planning.pdf"
+            pdf_name = audit_pdf_filename(collab_label, cid)
             pdf_name = f"{zip_prefix}{pdf_name}" if zip_prefix else pdf_name
             pdf_buf = BytesIO()
             pages_written = 0
