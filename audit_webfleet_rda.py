@@ -336,21 +336,26 @@ def audit_safe_filename(x):
     return s[:180] if s else "collaborateur"
 
 
-def audit_pdf_filename(collab_label, collab_id, max_length: int = 60) -> str:
-    """Return a short, unique and filesystem-safe collaborator PDF name."""
+def audit_pdf_filename(collab_label, collab_id, max_length: int = 50) -> str:
+    """Return ``Name_1234.pdf`` without repeating label metadata."""
     extension = ".pdf"
-    id_marker = "__id_"
-    safe_name = audit_safe_filename(collab_label)
+    separator = "_"
+    # Display labels include identifiers such as ``(ID: ..., RDA: ..., WF: ...)``.
+    # They are useful in the UI, but including them in the file name duplicates
+    # the collaborator ID and produces unnecessarily long paths.
+    name_only = re.sub(r"\s*\([^)]*\)\s*$", "", str(collab_label)).strip()
+    safe_name = audit_safe_filename(name_only)
     safe_id = audit_safe_filename(collab_id)
+    safe_id = re.sub(r"^(?:collab[-_])+", "", safe_id, flags=re.IGNORECASE) or "unknown"
 
-    max_id_length = max_length - len(id_marker) - len(extension) - 1
+    max_id_length = max_length - len(separator) - len(extension) - 1
     if len(safe_id) > max_id_length:
         digest = hashlib.sha256(safe_id.encode("utf-8")).hexdigest()[:8]
         safe_id = f"{safe_id[:max_id_length - len(digest) - 1]}_{digest}"
 
-    name_length = max_length - len(id_marker) - len(safe_id) - len(extension)
+    name_length = max_length - len(separator) - len(safe_id) - len(extension)
     safe_name = safe_name[:max(1, name_length)]
-    return f"{safe_name}{id_marker}{safe_id}{extension}"
+    return f"{safe_name}{separator}{safe_id}{extension}"
 
 
 def audit_join_ids(values):
