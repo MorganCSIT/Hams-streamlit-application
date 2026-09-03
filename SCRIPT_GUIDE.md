@@ -277,7 +277,8 @@ This script loads several functions from `Scripts/Check LTR.ipynb`. The notebook
 |---|---|
 | Classeur collaborateurs matches | Excel workbook that maps/identifies collaborators. |
 | Fichier RDA fusionne | RDA data to check. CSV, XLSX, or XLS. |
-| Nom du dossier de sortie | Optional folder name for the result. |
+
+The output name is generated automatically using only the earliest and latest dates found in the uploaded RDA data. A specifically selected week is also included in the selected-week workbook and ZIP names.
 
 ### Main Rules Checked
 

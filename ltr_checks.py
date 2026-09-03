@@ -1,11 +1,39 @@
 from app_config import *
 from ui_common import read_any_flex, render_blocking_run_warning, render_download_or_placeholder, safe_folder_name
 
+
+def ltr_generated_output_name(
+    selected_dates: tuple[date, date] | list[date] | None = None,
+) -> str:
+    """Build the automatic LTR output name, including a selected date range."""
+    if selected_dates and len(selected_dates) == 2:
+        start_date, end_date = selected_dates
+        return f"LTR_{start_date.strftime('%Y%m%d')}_to_{end_date.strftime('%Y%m%d')}"
+    return "LTR"
+
+
+def ltr_rda_date_range(df: pd.DataFrame) -> tuple[date, date] | None:
+    """Return the earliest start and latest end date in normalized RDA data."""
+    date_values = []
+    for column in ("start_dt_local", "end_dt_local"):
+        if column in df.columns:
+            parsed = pd.to_datetime(df[column], errors="coerce").dropna()
+            if not parsed.empty:
+                date_values.extend((parsed.min(), parsed.max()))
+    if not date_values:
+        return None
+    return min(date_values).date(), max(date_values).date()
+
+
 def ltr_unique_output_root(output_name: str) -> Path:
-    safe_name = safe_folder_name(output_name) if output_name.strip() else f"LTR_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    safe_name = safe_folder_name(output_name) if output_name.strip() else ltr_generated_output_name()
     root = get_session_output_root(LTR_OUTPUT_FOLDER) / safe_name
     if root.exists():
-        root = root.with_name(f"{root.name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
+        base_root = root
+        suffix = 2
+        while root.exists():
+            root = base_root.with_name(f"{base_root.name}_{suffix}")
+            suffix += 1
     root.mkdir(parents=True, exist_ok=True)
     return root
 
@@ -434,17 +462,32 @@ def ltr_zip_full_and_week(result: dict, week_workbook_path: Path, start_date: da
     return package_path
 
 
-def ltr_process(matched_upload, rda_upload, output_name: str) -> dict:
-    output_root = ltr_unique_output_root(output_name)
+def ltr_process(matched_upload, rda_upload) -> dict:
+    output_root = ltr_unique_output_root(ltr_generated_output_name())
     input_dir = output_root / "inputs"
     matched_path = ltr_save_upload(matched_upload, input_dir)
     rda_path = ltr_save_upload(rda_upload, input_dir)
-    workbook_path = ltr_workbook_path(output_root)
-
     env = ltr_load_notebook_functions(ltr_notebook_mtime())
 
     df_raw = env["load_and_normalize"](str(rda_path))
     matched = env["load_matched_collabs"](str(matched_path))
+
+    rda_date_range = ltr_rda_date_range(df_raw)
+    desired_name = ltr_generated_output_name(rda_date_range)
+    if output_root.name != desired_name:
+        desired_root = output_root.with_name(desired_name)
+        if desired_root.exists():
+            base_root = desired_root
+            suffix = 2
+            while desired_root.exists():
+                desired_root = base_root.with_name(f"{desired_name}_{suffix}")
+                suffix += 1
+        output_root.rename(desired_root)
+        output_root = desired_root
+        input_dir = output_root / "inputs"
+        matched_path = input_dir / matched_path.name
+        rda_path = input_dir / rda_path.name
+    workbook_path = ltr_workbook_path(output_root)
     df_raw = env["attach_collab_master"](df_raw, matched)
     df = env["add_interval_columns"](df_raw)
     services_df, df_tagged, orphan_pauses_df = env["build_services_and_tagged_rows"](df)
@@ -725,10 +768,9 @@ def render_ltr_task() -> None:
     st.title("Contrôles LTR")
     st.caption("Exécute les contrôles LTR hybrides et crée le classeur Excel multi-feuilles avec un tableau de bord d'audit.")
 
-    cols = st.columns(3)
+    cols = st.columns(2)
     matched_file = cols[0].file_uploader("Fichier mapping", type=["xlsx", "xls"], key="ltr_matched")
     rda_file = cols[1].file_uploader("Fichier RDA", type=["xlsx", "xls", "csv"], key="ltr_rda")
-    output_name = cols[2].text_input("Nom du dossier de sortie", value="")
 
     option_cols = st.columns([1.2, 2.8])
     choose_week_output = option_cols[0].checkbox("Choisir des dates spécifiques", key="ltr_choose_week_dates")
@@ -762,7 +804,7 @@ def render_ltr_task() -> None:
         progress = st.progress(0.0, text="Démarrage des contrôles LTR")
         try:
             progress.progress(0.1, text="Chargement des fichiers et de la logique notebook")
-            result = ltr_process(matched_file, rda_file, output_name)
+            result = ltr_process(matched_file, rda_file)
             if choose_week_output:
                 week_start, week_end = week_date_range
                 progress.progress(0.82, text="Création du classeur LTR semaine")
