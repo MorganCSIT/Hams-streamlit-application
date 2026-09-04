@@ -494,7 +494,7 @@ def render_planning_download_task() -> None:
         )
         if len(available_paths) > 1:
             st.download_button(
-                "Télécharger les fichiers sélectionnés sans modification (ZIP)",
+                "Télécharger les fichiers sélectionnés non fusionnés (ZIP)",
                 create_zip_bytes(available_paths),
                 file_name="plannings_selectionnes.zip",
                 mime="application/zip",
@@ -568,5 +568,6 @@ def render_planning_download_task() -> None:
                 file_name="tous_les_plannings_du_serveur.zip",
                 mime="application/zip",
                 key="planning_all_server_zip_download",
+                type="primary",
                 width="stretch",
             )
