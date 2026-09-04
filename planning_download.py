@@ -2,6 +2,7 @@ from app_config import *
 from ui_common import read_csv_flex, render_blocking_run_warning, render_download_for_path
 
 import posixpath
+import shutil
 
 try:
     import paramiko
@@ -218,6 +219,47 @@ def create_zip_bytes(paths: list[Path]) -> bytes:
     return buffer.getvalue()
 
 
+def download_sftp_files_as_zip(
+    host: str,
+    username: str,
+    password: str,
+    remote_folder: str,
+    remote_names: list[str],
+    port: int = 22,
+    progress_callback=None,
+) -> tuple[bytes, list[dict[str, str]]]:
+    """Download several remote files through one SFTP session into one ZIP."""
+    if paramiko is None:
+        raise RuntimeError("Paramiko n'est pas installé. Ajoutez-le aux dépendances puis relancez l'application.")
+
+    buffer = BytesIO()
+    errors = []
+    transport = paramiko.Transport((host, port))
+    try:
+        transport.connect(username=username, password=password)
+        sftp = paramiko.SFTPClient.from_transport(transport)
+        try:
+            with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+                total = len(remote_names)
+                for index, remote_name in enumerate(remote_names, start=1):
+                    try:
+                        remote_path = posixpath.join(remote_folder, remote_name)
+                        with sftp.open(remote_path, "rb") as source, archive.open(
+                            posixpath.basename(remote_name), "w"
+                        ) as destination:
+                            shutil.copyfileobj(source, destination)
+                    except Exception as exc:
+                        errors.append({"file": remote_name, "error": str(exc)})
+                    if progress_callback is not None:
+                        progress_callback(index, total, remote_name)
+        finally:
+            sftp.close()
+    finally:
+        transport.close()
+
+    buffer.seek(0)
+    return buffer.getvalue(), errors
+
 def create_merged_planning_csv_bytes(paths: list[Path]) -> bytes:
     frames = []
     for path in paths:
@@ -242,8 +284,8 @@ def render_planning_download_task() -> None:
 
     today = date.today()
     date_cols = st.columns(2)
-    from_planning_date = date_cols[0].date_input("From planning date", value=today)
-    to_planning_date = date_cols[1].date_input("To planning date", value=today)
+    from_planning_date = date_cols[0].date_input("Date planning de début", value=today)
+    to_planning_date = date_cols[1].date_input("Date planning de fin", value=today)
 
     with st.expander("Serveur SFTP", expanded=True):
         server_cols = st.columns(4)
@@ -267,7 +309,7 @@ def render_planning_download_task() -> None:
         help="Filtre optionnel selon les préfixes à chercher sur le serveur.",
     )
 
-    if st.button("Find / update files", type="primary", width="stretch"):
+    if st.button("Rechercher et préparer les plannings sélectionnés", type="primary", width="stretch"):
         render_blocking_run_warning()
         st.session_state.pop("planning_all_server_zip", None)
         download_folder = get_planning_archive_folder()
@@ -397,93 +439,134 @@ def render_planning_download_task() -> None:
     if not result:
         return
 
-    st.subheader("Résumé")
-    metric_cols = st.columns(4)
-    metric_cols[0].metric("Fichiers serveur", result.get("server_total_count", 0))
-    metric_cols[1].metric("Planning serveur", result.get("server_planning_count", 0))
-    metric_cols[2].metric("Téléchargés serveur", len(result["downloaded"]))
-    metric_cols[3].metric("Manquants", len(result["missing"]))
+    if result["missing"]:
+        st.error(
+            f"Attention: {len(result['missing'])} planning(s) demandé(s) sont absents du serveur. "
+            "Consultez la liste détaillée ci-dessous."
+        )
+
+    st.subheader("Résultat de la recherche")
+    st.caption(
+        "Le premier chiffre décrit les plannings disponibles sur le serveur. "
+        "Les deux autres concernent uniquement les dates et sources demandées ci-dessus."
+    )
+    metric_cols = st.columns(3)
+    metric_cols[0].metric(
+        "Plannings sur le serveur",
+        result.get("server_planning_count", 0),
+        help="Nombre de fichiers planning CSV reconnus sur le serveur, toutes dates confondues.",
+    )
+    metric_cols[1].metric(
+        "Plannings demandés trouvés",
+        len(result["downloaded"]),
+        help="Fichiers correspondant aux dates et sources sélectionnées, téléchargés et prêts.",
+    )
+    metric_cols[2].metric(
+        "Plannings demandés manquants",
+        len(result["missing"]),
+        help="Combinaisons date/source demandées pour lesquelles aucun fichier n'existe sur le serveur.",
+    )
 
     if result.get("requested_server_files"):
-        st.subheader("Fichiers demandés trouvés sur le serveur")
+        st.subheader("Votre sélection")
+        st.caption(
+            "Fichiers trouvés pour les dates et sources demandées. "
+            "La version la plus récente de chaque planning est utilisée."
+        )
         st.dataframe(pd.DataFrame(result["requested_server_files"]), width="stretch", hide_index=True)
     elif not result["errors"]:
         st.info("Aucun fichier planning correspondant aux dates sélectionnées n'a été trouvé sur le serveur.")
 
     if result["missing"]:
-        st.warning("Fichiers demandés non disponibles sur le serveur.")
+        st.subheader("Détail des plannings demandés manquants")
         st.dataframe(pd.DataFrame(result["missing"]), width="stretch", hide_index=True)
 
     if result["errors"]:
         st.error("Certaines recherches ou téléchargements ont échoué.")
         st.dataframe(pd.DataFrame(result["errors"]), width="stretch", hide_index=True)
 
-    server_file_names = result.get("server_file_names", [])
-    if server_file_names:
-        st.subheader("Archive serveur complète")
-        all_server_zip = st.session_state.get("planning_all_server_zip")
-        if st.button("Préparer tout fishier dans le server", width="stretch"):
-            if not sftp_fields_ready(host, int(port), username, password):
-                st.warning("Les 4 champs SFTP doivent être renseignés pour préparer le ZIP complet du serveur.")
-            else:
-                all_server_folder = get_planning_archive_folder()
-                all_server_paths = []
-                all_server_errors = []
-                full_progress = st.progress(0, text="Préparation du ZIP complet du serveur...")
-                for index, remote_name in enumerate(server_file_names, start=1):
-                    try:
-                        local_path = download_sftp_file(
-                            host.strip(),
-                            username.strip(),
-                            password,
-                            REMOTE_ROOT,
-                            remote_name,
-                            all_server_folder,
-                            int(port),
-                        )
-                        all_server_paths.append(local_path)
-                        full_progress.progress(
-                            int(index / len(server_file_names) * 100),
-                            text=f"Ajout au ZIP serveur: {index}/{len(server_file_names)}",
-                        )
-                    except Exception as exc:
-                        all_server_errors.append({"file": remote_name, "error": str(exc)})
-
-                if all_server_paths:
-                    all_server_zip = create_zip_bytes(all_server_paths)
-                    st.session_state["planning_all_server_zip"] = all_server_zip
-                if all_server_errors:
-                    st.error("Certains fichiers du serveur n'ont pas pu être ajoutés au ZIP.")
-                    st.dataframe(pd.DataFrame(all_server_errors), width="stretch", hide_index=True)
-
-        if all_server_zip:
-            st.download_button(
-                "Télécharger tout fishier dans le server",
-                all_server_zip,
-                file_name="tout fishier dans le server.zip",
-                mime="application/zip",
-                key="planning_all_server_zip_download",
-            )
-
     available_paths = [Path(path) for path in result["available"] if Path(path).is_file()]
     if available_paths:
-        st.subheader("Téléchargements")
+        st.subheader("Télécharger votre sélection")
+        st.caption(
+            "Les téléchargements ci-dessous contiennent uniquement les fichiers trouvés pour les dates et sources "
+            "que vous avez demandées."
+        )
         if len(available_paths) > 1:
             st.download_button(
-                "Télécharger tous les fichiers ZIP",
+                "Télécharger les fichiers sélectionnés sans modification (ZIP)",
                 create_zip_bytes(available_paths),
-                file_name="planning_files.zip",
+                file_name="plannings_selectionnes.zip",
                 mime="application/zip",
                 key="planning_download_zip",
             )
 
         st.download_button(
-            "Télécharger le planning fusionné CSV",
+            "Télécharger les fichiers sélectionnés fusionnés en un CSV",
             create_merged_planning_csv_bytes(available_paths),
             file_name=f"planning_merged_{result['from_planning_date']}_to_{result['to_planning_date']}.csv",
             mime="text/csv",
             key="planning_download_merged_csv",
         )
 
+        st.caption(
+            "Fichiers individuels: chaque bouton ci-dessous télécharge un fichier planning original de la sélection."
+        )
         for path in available_paths:
-            render_download_for_path(path, f"Télécharger {path.name}", key=f"planning_download_{path.name}")
+            render_download_for_path(
+                path,
+                f"Télécharger le fichier original: {path.name}",
+                key=f"planning_download_{path.name}",
+            )
+
+    server_file_names = result.get("server_file_names", [])
+    if server_file_names:
+        st.subheader("Tous les plannings du serveur")
+        st.caption(
+            "Option indépendante de votre sélection: prépare un ZIP avec tous les fichiers planning CSV reconnus "
+            "sur le serveur, pour toutes les dates et toutes les sources."
+        )
+        all_server_zip = st.session_state.get("planning_all_server_zip")
+        if st.button("Préparer le ZIP de tous les plannings du serveur", width="stretch"):
+            if not sftp_fields_ready(host, int(port), username, password):
+                st.warning("Les 4 champs SFTP doivent être renseignés pour préparer le ZIP complet du serveur.")
+            else:
+                full_progress = st.progress(0, text="Préparation du ZIP complet du serveur...")
+
+                def update_full_progress(index, total, remote_name):
+                    full_progress.progress(
+                        int(index / total * 100),
+                        text=f"Ajout au ZIP: {index}/{total} — {remote_name}",
+                    )
+
+                try:
+                    all_server_zip, all_server_errors = download_sftp_files_as_zip(
+                        host.strip(),
+                        username.strip(),
+                        password,
+                        REMOTE_ROOT,
+                        server_file_names,
+                        int(port),
+                        update_full_progress,
+                    )
+                    completed_count = len(server_file_names) - len(all_server_errors)
+                    if completed_count:
+                        st.session_state["planning_all_server_zip"] = all_server_zip
+                        st.success(
+                            f"Archive prête: {completed_count} fichier(s) ajouté(s) sur {len(server_file_names)}."
+                        )
+                    if all_server_errors:
+                        st.error("Certains fichiers du serveur n'ont pas pu être ajoutés au ZIP.")
+                        st.dataframe(pd.DataFrame(all_server_errors), width="stretch", hide_index=True)
+                except Exception as exc:
+                    st.error(f"Impossible de préparer l'archive complète: {exc}")
+
+        if all_server_zip:
+            st.download_button(
+                "Télécharger tous les plannings du serveur (ZIP)",
+                all_server_zip,
+                file_name="tous_les_plannings_du_serveur.zip",
+                mime="application/zip",
+                key="planning_all_server_zip_download",
+                width="stretch",
+            )
