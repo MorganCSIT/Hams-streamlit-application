@@ -1,7 +1,9 @@
 import os
+import shutil
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import webbrowser
@@ -59,15 +61,32 @@ def _open_browser(port: int) -> None:
 
     for browser_path in _browser_candidates():
         if browser_path.exists():
+            # A separate profile forces a dedicated browser process that can
+            # be monitored instead of reusing a normal Edge/Chrome process.
+            profile_dir = Path(tempfile.mkdtemp(prefix="webfleet-tools-browser-"))
             try:
-                subprocess.Popen(
-                    [str(browser_path), f"--app={url}", "--new-window"],
+                browser_process = subprocess.Popen(
+                    [
+                        str(browser_path),
+                        f"--app={url}",
+                        f"--user-data-dir={profile_dir}",
+                        "--new-window",
+                        "--no-first-run",
+                        "--disable-background-mode",
+                    ],
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
                 )
-                return
             except OSError:
+                shutil.rmtree(profile_dir, ignore_errors=True)
                 continue
+
+            # Closing the app window ends its browser process. Streamlit has no
+            # browser-close callback, so terminate the packaged process here;
+            # Windows will then release its lock on the executable.
+            browser_process.wait()
+            shutil.rmtree(profile_dir, ignore_errors=True)
+            os._exit(0)
 
     webbrowser.open(url)
 
