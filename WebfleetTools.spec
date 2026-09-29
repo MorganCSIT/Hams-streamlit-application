@@ -5,8 +5,11 @@ from PyInstaller.utils.hooks import collect_all
 
 data_candidates = [('app.py', '.'), ('app_config.py', '.'), ('audit_webfleet_rda.py', '.'), ('ltr_checks.py', '.'), ('merge_files.py', '.'), ('nexus_batch_runner.py', '.'), ('planning_download.py', '.'), ('rda_transfers.py', '.'), ('ui_common.py', '.'), ('webfleet.py', '.'), ('company colors.png', '.'), ('feedback.png', '.'), ('.streamlit', '.streamlit'), ('Scripts', 'Scripts'), ('Templates', 'Templates')]
 datas = [(source, destination) for source, destination in data_candidates if Path(source).exists()]
+datas.append(('planning_rda_comparison.py', '.'))
 binaries = []
-hiddenimports = []
+# Streamlit executes app.py dynamically; include the comparison's imports in
+# PyInstaller analysis as well as its source in the extracted app directory.
+hiddenimports = ['planning_rda_comparison']
 tmp_ret = collect_all('streamlit')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 tmp_ret = collect_all('altair')

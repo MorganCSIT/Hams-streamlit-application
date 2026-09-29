@@ -1,6 +1,7 @@
 from app_config import *
 import concurrent.futures
 import hashlib
+from planning_rda_comparison import build_comparison_workbook
 
 from ui_common import read_csv_flex, render_blocking_run_warning
 
@@ -1003,9 +1004,12 @@ def audit_build_complete_package(result: dict, progress_cb=None, include_pairs: 
 
     cutting_package = audit_build_rda_cutting_package(result, cutting, progress_cb=_cutting_progress, include_pairs=include_pairs)
 
+    _prog(0.95, "Comparaison exploratoire Planning / RDA...")
+    comparison_bytes = build_comparison_workbook(result)
     _prog(0.95, "Assemblage du package final...")
     package_buf = BytesIO()
     with zipfile.ZipFile(package_buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("Planning_RDA_Comparison/planning_rda_comparison.xlsx", comparison_bytes.getvalue())
         excel_bytes = result.get("excel_bytes")
         if excel_bytes:
             excel_bytes.seek(0)
@@ -1626,6 +1630,10 @@ def audit_process(rda_file, wf_file, mapping_file, planning_file, progress_cb=No
         "rda_ids": _joined_map_ids(RDA_ID_CANDIDATES),
         "wf_ids": _joined_map_ids(UO_ID_CANDIDATES),
         "planning_ids": _joined_map_ids(PLAN_DISPLAY_ID_CANDIDATES),
+        "collab_all_ids": _joined_map_ids(list(dict.fromkeys(
+            RDA_ID_CANDIDATES + UO_ID_CANDIDATES + PLAN_DISPLAY_ID_CANDIDATES
+            + [c for c in MAP.columns if str(c).lower().startswith("no-collaborateur-")]
+        ))),
     }).dropna(subset=["collab_id"])
 
     map_df = pd.DataFrame({
@@ -1642,6 +1650,7 @@ def audit_process(rda_file, wf_file, mapping_file, planning_file, progress_cb=No
                 "rda_ids": audit_join_ids,
                 "wf_ids": audit_join_ids,
                 "planning_ids": audit_join_ids,
+                "collab_all_ids": audit_join_ids,
             })
         )
 
@@ -1856,6 +1865,12 @@ def audit_process(rda_file, wf_file, mapping_file, planning_file, progress_cb=No
             reasons.append("non_positive_span")
         drop_reasons.append(",".join(reasons))
     planning["_drop"] = drop_reasons
+    # Retain all source rows for reconciliation, including rows excluded from PDFs.
+    planning_comparison = planning.copy()
+    planning_comparison["collab_name"] = (
+        PLANNING.get("emp_lastname", pd.Series("", index=PLANNING.index)).fillna("").astype(str)
+        + " " + PLANNING.get("emp_firstname", pd.Series("", index=PLANNING.index)).fillna("").astype(str)
+    ).str.strip()
     planning = planning[planning["_drop"].str.len() == 0].copy()
     planning.drop(columns=["_drop"], inplace=True)
     planning["collab_id"] = planning["collab_id"].astype(str)
@@ -2332,7 +2347,9 @@ def audit_process(rda_file, wf_file, mapping_file, planning_file, progress_cb=No
         "wf": wf,
         "wf2": wf2,
         "map_df": map_df,
+        "client_map_df": map_sheets.get("Matched Clients", pd.DataFrame()).copy(),
         "planning": planning,
+        "planning_comparison": planning_comparison,
         "rda_daily": rda_daily,
         "agg_daily": agg_daily,
         "collab_stats": collab_stats,
@@ -3991,7 +4008,7 @@ def render_audit_task() -> None:
 
     if result:
         if complete_package:
-            st.success("Audit, PDFs Gantt et RDA cutting terminés. Le package complet est disponible au téléchargement.")
+            st.success("Audit, PDFs Gantt, RDA cutting et comparaison Planning / RDA terminés. Le package complet inclut le dossier Planning_RDA_Comparison et son Excel exploratoire.")
         else:
             st.success("Rapport Excel créé.")
         render_audit_dashboard(result)
