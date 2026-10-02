@@ -122,6 +122,10 @@ def ltr_load_notebook_functions(notebook_mtime: float) -> dict:
     notebook = json.loads(notebook_path.read_text(encoding="utf-8"))
     for cell_index in range(2, 9):
         source = "".join(notebook["cells"][cell_index]["source"])
+        source = source.replace(
+            "if len(vals):\n                rest.at[ix, \"roll14_back_true_hours\"]",
+            "if len(vals) and pd.Timestamp(g['service_date'].min()) <= start_date:\n                rest.at[ix, \"roll14_back_true_hours\"]",
+        )
         exec(compile(source, f"{notebook_path.name}:cell{cell_index + 1}", "exec"), env)
     return env
 
@@ -462,7 +466,50 @@ def ltr_zip_full_and_week(result: dict, week_workbook_path: Path, start_date: da
     return package_path
 
 
-def ltr_process(matched_upload, rda_upload, output_root: Path | None = None) -> dict:
+def ltr_history_warnings(dates, start_date, end_date):
+    """Report calendar days with no source records; absence is not proof of time off."""
+    days = set(pd.to_datetime(pd.Series(dates), errors="coerce").dropna().dt.date)
+    required = set(pd.date_range(pd.Timestamp(start_date) - pd.Timedelta(days=14), end_date).date)
+    missing = sorted(required - days)
+    if not missing:
+        return []
+    return [f"LTR : {len(missing)} jour(s) sans données RDA entre {min(required)} et {max(required)} "
+            f"(premier : {missing[0]}, dernier : {missing[-1]}). L'historique de deux semaines "
+            "peut être incomplet : le contrôle LTR ne peut pas être garanti précis. "
+            "Un jour sans entrée peut aussi être un jour de repos; vérifiez la couverture de l'export."]
+
+
+def ltr_complete_months(dates, today=None):
+    parsed = pd.to_datetime(pd.Series(dates), errors="coerce").dropna()
+    if parsed.empty:
+        return set()
+    first, last = parsed.min().date(), parsed.max().date()
+    today = today or date.today()
+    return {str(month) for month in pd.period_range(first, last, freq="M")
+            if first <= month.start_time.date() and last >= month.end_time.date()
+            and month.end_time.date() < today}
+
+
+def ltr_scope_sheets(sheets, date_range, complete_months=None):
+    scoped = {name: (ltr_date_filtered_sheet(frame, *date_range) if date_range else frame.copy())
+              for name, frame in sheets.items() if name != "SUMMARY_BY_MONTH"}
+    infraction_sheets = {"ALL_INFRACTIONS", "OVER_50H_WEEK", "STREAK_7DAYS", "SPAN_OVER_14H", "REST_UNDER_11H", "PAUSE_INSUFF"}
+    for name in infraction_sheets:
+        frame = scoped.get(name, pd.DataFrame())
+        if complete_months is not None and not frame.empty:
+            if "TARGET_MONTH" in frame:
+                months = frame["TARGET_MONTH"].astype(str)
+            else:
+                column = next((c for c in ("EVENT_DATE", "service_date", "week_monday") if c in frame), None)
+                if column is None:
+                    scoped[name] = frame.iloc[0:0].copy()
+                    continue
+                months = pd.to_datetime(frame[column], errors="coerce").dt.strftime("%Y-%m")
+            scoped[name] = frame.loc[months.isin(complete_months)].copy()
+    return scoped
+
+
+def ltr_process(matched_upload, rda_upload, output_root: Path | None = None, date_range=None, exclude_incomplete_months=False) -> dict:
     """Run LTR checks, optionally inside a caller-selected output folder."""
     automatic_output_root = output_root is None
     output_root = Path(output_root) if output_root is not None else ltr_unique_output_root(ltr_generated_output_name())
@@ -498,6 +545,7 @@ def ltr_process(matched_upload, rda_upload, output_root: Path | None = None) -> 
     over50_detail, over50_all = env["check_over_50h"](calendar_slices_df)
     streak_detail, streak_all = env["check_streak_7days"](services_df)
     span_detail, span_all = env["check_span_over_14h"](services_df)
+    # Keep full history, but do not accept a partial lookback as a known average.
     rest_detail, rest_all, rest_review = env["check_rest_under_11h"](services_df)
     breaks_detail, breaks_all, breaks_audit = env["check_breaks"](services_df)
     data_quality = env["build_data_quality"](df_tagged, orphan_pauses_df)
@@ -549,9 +597,35 @@ def ltr_process(matched_upload, rda_upload, output_root: Path | None = None) -> 
         "DATA_QUALITY": data_quality,
         "UNMATCHED_MAPPING": unmatched_mapping,
     }
+    warnings = []
+    if date_range is not None or exclude_incomplete_months:
+        complete_months = ltr_complete_months(df["start_dt_local"]) if exclude_incomplete_months else None
+        sheets = ltr_scope_sheets(sheets, date_range, complete_months)
+        if date_range:
+            warnings.extend(ltr_history_warnings(df["start_dt_local"], *date_range))
+            df = ltr_date_filtered_sheet(df, *date_range)
+            unrecognized_rows = ltr_date_filtered_sheet(unrecognized_rows, *date_range)
+            unrecognized_summary = ltr_unrecognized_summary(unrecognized_rows)
+            unmatched_mapping = ltr_unmatched_mapping_report(env, df, matched_path, unrecognized_summary)
+            sheets["UNMATCHED_MAPPING"] = unmatched_mapping
+        if exclude_incomplete_months:
+            selected_months = set(pd.to_datetime(df["start_dt_local"], errors="coerce").dropna().dt.strftime("%Y-%m"))
+            excluded = sorted(selected_months - complete_months)
+            if excluded:
+                warnings.append("LTR : infractions exclues pour les mois incomplets : " + ", ".join(excluded) + ". Les données restent utilisées comme historique.")
+        all_infractions = sheets["ALL_INFRACTIONS"]
+        services_audit = sheets["SERVICES_AUDIT"]
+        calendar_slices_df = sheets["CALENDAR_HOUR_SLICES"]
+        data_quality = sheets["DATA_QUALITY"]
+        rest_review = sheets["REST_REVIEW_ALLOWED"]
+        breaks_audit = sheets["PAUSE_AUDIT_SERVICES"]
+        summary_by_month = ltr_compute_summary(env, df, services_audit, calendar_slices_df, all_infractions, data_quality)
+        sheets = {"SUMMARY_BY_MONTH": summary_by_month, **sheets}
+        sheets["COVERAGE_WARNINGS"] = pd.DataFrame({"Warning": warnings})
     ltr_write_workbook(env, workbook_path, sheets)
 
     return {
+        "warnings": warnings,
         "output_root": output_root,
         "workbook_path": workbook_path,
         "sheets": sheets,
@@ -567,7 +641,7 @@ def ltr_process(matched_upload, rda_upload, output_root: Path | None = None) -> 
         "unmatched_mapping": unmatched_mapping,
         "metrics": {
             "raw_rows": len(df),
-            "services": len(services_df),
+            "services": len(services_audit),
             "calendar_slices": len(calendar_slices_df),
             "infractions": len(all_infractions),
             "affected_collaborators": all_infractions["collab_uid"].nunique() if "collab_uid" in all_infractions.columns and not all_infractions.empty else 0,

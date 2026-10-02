@@ -53,7 +53,7 @@ hours. Client counts use the main key in `Matched Clients` when aliases are mapp
 unambiguously, otherwise source IDs (name fallback when no ID is present), with
 separate checks for equal counts and matching client identities. Names are retained
 for reading the report; anonymized names do not merge different IDs. All source
-dates are included independently of PDF filters. RDA cutting does not change these
+dates are included unless the main date selector is enabled. RDA cutting does not change these
 totals. Missing mappings and invalid values remain visible for investigation.
 
 Entity detail sheets include `collab_all_ids` and `client_all_ids`, formatted as
@@ -62,3 +62,27 @@ Entity detail sheets include `collab_all_ids` and `client_all_ids`, formatted as
 summary sheets list contributing Planning and RDA IDs separately, since a summary
 can combine records with different IDs. Mapping aliases are included even when
 they have no records in the selected files; shared names do not create ID links.
+
+The comparison matches the uploaded reference's 15-sheet layout, including
+`Unassigned`. Collaborator detail sheets include mapped collaborators only;
+Overall and Daily retain unassigned time. Entries show recorded and calculated
+duration, a 0.01-minute match check, and the duration basis. Summary sheets
+separate recorded minutes from calculated fallback minutes. Only missing recorded
+durations fall back to start/end; negative durations remain invalid. Conflicting
+collaborator mapping aliases stop generation for correction.
+Select “Choisir des dates spécifiques” and August 1–31, 2026 to reproduce
+the reference period. The main date range applies to the audit report, PDFs, Planning / RDA
+comparison, RDA cutting, and included LTR results. When unchecked, the comparison includes all uploaded dates.
+
+The complete ZIP stores the audit workbook in `Webfleet_RDA_Audit_report/`.
+Adjusted RDA exports are in `Cut_Adjusted_RDA/`, with the before-cut charts
+in its `PDF_Day_Charts_Before_Cut/` subfolder.
+
+LTR computes its checks using the full uploaded RDA history before filtering
+results to the selected event dates. Earlier records remain available for the
+14-day backward rest average and other checks. Partial history is marked for
+review, not accepted as a proven average. The audit warns before generation when
+calendar days have no RDA records; these may be days off or missing data.
+LTR infraction sheets exclude months whose first and last calendar days are not
+covered by the upload, and the current unfinished month. Those records remain
+available as calculation context. Coverage warnings are included in the workbook.

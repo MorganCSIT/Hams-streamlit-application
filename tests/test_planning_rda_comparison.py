@@ -90,7 +90,7 @@ class ComparisonTests(unittest.TestCase):
     def test_invalid_rows_and_unmapped_identities_are_visible(self):
         result = fixture()
         result["planning_comparison"] = pd.DataFrame([
-            dict(collab_id=None, emp_nr="9", date="2026-08-01", duration_min=-5, client_name="empty empty"),
+            dict(collab_id=None, emp_nr="9", date="2026-08-01", noted_duration_min=-5, duration_min=-5, client_name="empty empty"),
             dict(collab_id="a", date="bad", duration_min=100),
         ])
         tables = build_comparison_tables(result)
@@ -104,11 +104,46 @@ class ComparisonTests(unittest.TestCase):
         empty = {"planning": pd.DataFrame(), "rda": pd.DataFrame()}
         self.assertEqual(build_comparison_tables(empty)["Overall"].iloc[0].planned_min, 0)
         workbook = load_workbook(build_comparison_workbook(fixture()))
-        self.assertEqual(len(workbook.sheetnames), 14)
+        self.assertEqual(len(workbook.sheetnames), 15)
         sheet = workbook["Collaborators"]
         self.assertEqual(sheet.freeze_panes, "A2")
         self.assertEqual(sheet["B2"].value, "=literal name")
         self.assertEqual(sheet["B2"].data_type, "s")
+
+    def test_duration_reconciliation_and_mapped_scope(self):
+        result = fixture()
+        result["planning_comparison"] = pd.DataFrame([
+            dict(collab_id="a", date="2026-08-01", noted_duration_min=20, duration_min=20,
+                 start="2026-08-01 10:00", end="2026-08-01 10:30"),
+            dict(collab_id="a", date="2026-08-01", noted_duration_min=None, duration_min=30,
+                 start="2026-08-01 10:00", end="2026-08-01 10:30"),
+            dict(collab_id=None, emp_nr="99", date="2026-08-01", noted_duration_min=10, duration_min=10),
+            dict(collab_id="a", date="2026-08-01", noted_duration_min=-5, duration_min=-5,
+                 start="2026-08-01 10:00", end="2026-08-01 10:30"),
+        ])
+        tables = build_comparison_tables(result)
+        total = tables["Overall"].iloc[0]
+        self.assertEqual(total.planned_min, 60)
+        self.assertEqual(total.planned_noted_min, 30)
+        self.assertEqual(total.planned_fallback_min, 30)
+        self.assertEqual(total.planned_fallback_rows, 1)
+        self.assertEqual(total.duration_mismatch_rows, 1)
+        self.assertEqual(total.invalid_duration_rows, 1)
+        self.assertEqual(len(tables["Unassigned"]), 1)
+        self.assertEqual(tables["Collaborators"].planned_min.sum(), 50)
+        self.assertEqual(tables["Unassigned"].minutes.sum(), 10)
+        self.assertEqual(len(build_comparison_tables(result, ("2026-08-02", "2026-08-03"))["Entries"]), 1)
+
+    def test_reference_workbook_schema(self):
+        reference = Path(__file__).resolve().parents[1] / "planning_rda_comparison.xlsx"
+        if not reference.exists():
+            self.skipTest("Uploaded reference workbook unavailable")
+        workbook = load_workbook(reference, read_only=True)
+        tables = build_comparison_tables(fixture())
+        self.assertEqual(list(tables), workbook.sheetnames)
+        for name, table in tables.items():
+            self.assertEqual(list(table.columns), list(next(workbook[name].values)), name)
+        workbook.close()
 
     def test_complete_package_includes_new_sibling_folder(self):
         import audit_webfleet_rda as audit
@@ -121,7 +156,7 @@ class ComparisonTests(unittest.TestCase):
                 patch.object(audit, "audit_build_rda_cutting_package", return_value={}):
             package = audit.audit_build_complete_package(result)
             with ZipFile(package["zip_bytes"]) as archive:
-                self.assertIn("Audit_Report/audit_report.xlsx", archive.namelist())
+                self.assertIn("Webfleet_RDA_Audit_report/audit_report.xlsx", archive.namelist())
                 data = archive.read("Planning_RDA_Comparison/planning_rda_comparison.xlsx")
                 self.assertIn("Client_Detail", load_workbook(BytesIO(data)).sheetnames)
 

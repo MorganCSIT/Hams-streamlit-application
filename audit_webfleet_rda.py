@@ -2,7 +2,7 @@ from app_config import *
 import concurrent.futures
 import hashlib
 from planning_rda_comparison import build_comparison_workbook
-from ltr_checks import ltr_process
+from ltr_checks import ltr_process, ltr_history_warnings
 
 from ui_common import read_csv_flex, render_blocking_run_warning
 
@@ -925,25 +925,25 @@ def audit_build_rda_cutting_package(result: dict, cutting: dict, progress_cb=Non
         excel_bytes = cutting.get("excel_bytes")
         if excel_bytes:
             excel_bytes.seek(0)
-            zf.writestr(f"Adjusted_RDA/{cutting.get('download_name', 'rda_cutting.xlsx')}", excel_bytes.read())
+            zf.writestr(f"Cut_Adjusted_RDA/{cutting.get('download_name', 'rda_cutting.xlsx')}", excel_bytes.read())
         rda_input_export = cutting.get("rda_input_export", pd.DataFrame())
         if rda_input_export is not None and not rda_input_export.empty:
             csv_name = f"{Path(cutting.get('download_name', 'rda_cutting.xlsx')).stem}_RDA_Cut_Input_Format.csv"
             csv_text = audit_drop_tz_excel_safe(rda_input_export).to_csv(index=False)
-            zf.writestr(f"Adjusted_RDA/{csv_name}", csv_text.encode("utf-8-sig"))
+            zf.writestr(f"Cut_Adjusted_RDA/{csv_name}", csv_text.encode("utf-8-sig"))
         rda_input_export_with_removed = cutting.get("rda_input_export_with_removed", pd.DataFrame())
         if rda_input_export_with_removed is not None and not rda_input_export_with_removed.empty:
             removed_stem = f"{Path(cutting.get('download_name', 'rda_cutting.xlsx')).stem}_RDA_Cut_Input_Format_With_Removed"
             removed_safe = audit_drop_tz_excel_safe(rda_input_export_with_removed)
             zf.writestr(
-                f"Adjusted_RDA/{removed_stem}.csv",
+                f"Cut_Adjusted_RDA/{removed_stem}.csv",
                 removed_safe.to_csv(index=False).encode("utf-8-sig"),
             )
             removed_xlsx = BytesIO()
             with pd.ExcelWriter(removed_xlsx, engine="openpyxl") as xw:
                 removed_safe.to_excel(xw, index=False, sheet_name="RDA_With_Removed")
             removed_xlsx.seek(0)
-            zf.writestr(f"Adjusted_RDA/{removed_stem}.xlsx", removed_xlsx.read())
+            zf.writestr(f"Cut_Adjusted_RDA/{removed_stem}.xlsx", removed_xlsx.read())
 
         changed_pairs = audit_cut_changed_pairs(cutting)
         if include_pairs is not None:
@@ -955,7 +955,7 @@ def audit_build_rda_cutting_package(result: dict, cutting: dict, progress_cb=Non
                 review_result,
                 progress_cb=progress_cb,
                 include_pairs=changed_pairs,
-                zip_prefix="PDF_Day_Charts_Before_Cut/",
+                zip_prefix="Cut_Adjusted_RDA/PDF_Day_Charts_Before_Cut/",
             )
             if pdf_zip:
                 pdf_zip.seek(0)
@@ -977,7 +977,7 @@ def audit_build_rda_cutting_package(result: dict, cutting: dict, progress_cb=Non
     }
 
 
-def audit_build_complete_package(result: dict, progress_cb=None, include_pairs: set[tuple[str, str]] | None = None, ltr_result: dict | None = None) -> dict:
+def audit_build_complete_package(result: dict, progress_cb=None, include_pairs: set[tuple[str, str]] | None = None, ltr_result: dict | None = None, comparison_date_range=None) -> dict:
     def _prog(pct, msg):
         if progress_cb:
             progress_cb(min(max(float(pct or 0.0), 0.0), 1.0), msg)
@@ -1006,7 +1006,7 @@ def audit_build_complete_package(result: dict, progress_cb=None, include_pairs: 
     cutting_package = audit_build_rda_cutting_package(result, cutting, progress_cb=_cutting_progress, include_pairs=include_pairs)
 
     _prog(0.95, "Comparaison exploratoire Planning / RDA...")
-    comparison_bytes = build_comparison_workbook(result)
+    comparison_bytes = build_comparison_workbook(result, date_range=comparison_date_range)
     _prog(0.95, "Assemblage du package final...")
     package_buf = BytesIO()
     with zipfile.ZipFile(package_buf, "w", zipfile.ZIP_DEFLATED) as zf:
@@ -1018,7 +1018,7 @@ def audit_build_complete_package(result: dict, progress_cb=None, include_pairs: 
         if excel_bytes:
             excel_bytes.seek(0)
             excel_name = Path(result.get("excel_path", "audit_report.xlsx")).name
-            zf.writestr(f"Audit_Report/{excel_name}", excel_bytes.read())
+            zf.writestr(f"Webfleet_RDA_Audit_report/{excel_name}", excel_bytes.read())
 
         if main_pdf_zip:
             main_pdf_zip.seek(0)
@@ -1461,7 +1461,7 @@ def audit_combine_plan_date_time(parsed_dates, time_ser, tz_name=AUDIT_TZ_NAME):
 # Audit — main processing function
 # ============================================================
 
-def audit_process(rda_file, wf_file, mapping_file, planning_file, progress_cb=None):
+def audit_process(rda_file, wf_file, mapping_file, planning_file, progress_cb=None, date_range=None):
     def _prog(pct, msg):
         if progress_cb:
             progress_cb(pct, msg)
@@ -1554,6 +1554,7 @@ def audit_process(rda_file, wf_file, mapping_file, planning_file, progress_cb=No
             if rda_cols["prestation_name"] else ""
         ),
     })
+    rda["noted_duration_min"] = rda["duree_min"]
     mask = rda["duree_min"].isna() & rda["start"].notna() & rda["end"].notna()
     rda.loc[mask, "duree_min"] = (rda.loc[mask, "end"] - rda.loc[mask, "start"]).dt.total_seconds() / 60.0
 
@@ -1572,6 +1573,7 @@ def audit_process(rda_file, wf_file, mapping_file, planning_file, progress_cb=No
         if not rda_cols["prestation_name"]:
             rda["prestation_text"] = RDA[best_col].apply(audit_clean_legend_text)
     rda["rda_row_id"] = np.arange(len(rda), dtype=int)
+    rda["source_row"] = np.arange(2, len(rda) + 2)
 
     _prog(0.20, "Normalisation Webfleet...")
 
@@ -1661,6 +1663,17 @@ def audit_process(rda_file, wf_file, mapping_file, planning_file, progress_cb=No
                 "collab_all_ids": audit_join_ids,
             })
         )
+
+    # An alias must belong to one collaborator; never silently choose a row.
+    alias_owners = {}
+    for row in map_raw.to_dict("records"):
+        for alias in audit_join_ids([row.get("collab_all_ids", "")]).split("/"):
+            alias = audit_to_int_str(alias)
+            if alias:
+                alias_owners.setdefault(alias, set()).add(row["collab_id"])
+    conflicts = sorted(alias for alias, owners in alias_owners.items() if len(owners) > 1)
+    if conflicts:
+        raise ValueError("Conflicting collaborator mapping IDs: " + ", ".join(conflicts))
 
     sarlno_to_id = {}
     for col in RDA_ID_CANDIDATES:
@@ -1774,6 +1787,7 @@ def audit_process(rda_file, wf_file, mapping_file, planning_file, progress_cb=No
         PLANNING[plan_cols["client_lastname"]].apply(audit_clean_legend_text)
         if plan_cols["client_lastname"] else pd.Series("", index=PLANNING.index)
     )
+    planning["source_row"] = np.arange(2, len(planning) + 2)
     planning["client_name"] = (planning_lastname + " " + planning_firstname).str.strip()
     planning["client_label"] = planning["client_name"].fillna("").astype(str).str.strip()
     if "client_nr" in planning.columns:
@@ -1783,6 +1797,21 @@ def audit_process(rda_file, wf_file, mapping_file, planning_file, progress_cb=No
             planning["client_label"],
             np.where(nr_label.str.len() > 0, "Client " + nr_label, ""),
         )
+
+    if date_range is not None:
+        range_start, range_end = (pd.Timestamp(value).date() for value in date_range)
+        if range_start > range_end:
+            raise ValueError("Audit start date must precede end date")
+        def in_period(values):
+            days = pd.to_datetime(values, errors="coerce").dt.date
+            return days.notna() & days.between(range_start, range_end)
+        rda = rda.loc[in_period(rda["jour"])].copy()
+        RDA_SOURCE = RDA_SOURCE.loc[rda.index].reset_index(drop=True)
+        rda = rda.reset_index(drop=True)
+        rda["rda_row_id"] = np.arange(len(rda), dtype=int)
+        wf = wf.loc[in_period(wf["date"])].copy()
+        planning = planning.loc[in_period(planning["date"])].copy()
+        PLANNING = PLANNING.loc[planning.index].copy()
 
     client_known_ids = audit_client_known_ids(map_sheets)
     unmatched_parts = [
@@ -1851,6 +1880,7 @@ def audit_process(rda_file, wf_file, mapping_file, planning_file, progress_cb=No
 
     overnight = planning["start"].notna() & planning["end"].notna() & (planning["end"] < planning["start"])
     planning.loc[overnight, "end"] = planning.loc[overnight, "end"] + pd.Timedelta(days=1)
+    planning["noted_duration_min"] = planning["duration_min"]
     dur_missing = planning["duration_min"].isna() & planning["start"].notna() & planning["end"].notna()
     planning.loc[dur_missing, "duration_min"] = (planning.loc[dur_missing, "end"] - planning.loc[dur_missing, "start"]).dt.total_seconds() / 60.0
 
@@ -3332,6 +3362,8 @@ def audit_collect_pdf_job() -> None:
 def audit_render_pdf_controls(result: dict) -> None:
     audit_collect_pdf_job()
     complete_package = st.session_state.get("latest_audit_complete_package")
+    if complete_package:
+        return
     status = st.session_state.get("latest_audit_pdf_status")
     future = st.session_state.get("latest_audit_pdf_future")
 
@@ -3355,29 +3387,17 @@ def audit_render_pdf_controls(result: dict) -> None:
         else:
             st.caption("Les PDFs Gantt sont générés pendant l'audit complet.")
     with p2:
-        if complete_package and complete_package.get("zip_bytes"):
-            zip_bytes = complete_package["zip_bytes"]
-            zip_bytes.seek(0)
+        if st.button("Relancer les PDFs", key="audit_gen_pdf", use_container_width=True):
+            audit_start_pdf_job(result, force=True, include_pairs=st.session_state.get("latest_audit_pdf_include_pairs"))
+            st.rerun()
+        pdf_zip = st.session_state.get("latest_audit_pdf_zip")
+        if pdf_zip:
+            pdf_zip.seek(0)
             st.download_button(
-                "Télécharger package complet",
-                zip_bytes,
-                file_name=complete_package.get("download_name", "audit_webfleet_rda_complete.zip"),
-                mime=complete_package.get("output_mime", "application/zip"),
-                key="audit_complete_package_dashboard_download",
+                "Télécharger les PDFs (zip)", pdf_zip,
+                file_name="audit_pdfs_gantt.zip", mime="application/zip",
                 use_container_width=True,
             )
-        else:
-            if st.button("Relancer les PDFs", key="audit_gen_pdf", use_container_width=True):
-                audit_start_pdf_job(result, force=True, include_pairs=st.session_state.get("latest_audit_pdf_include_pairs"))
-                st.rerun()
-            pdf_zip = st.session_state.get("latest_audit_pdf_zip")
-            if pdf_zip:
-                pdf_zip.seek(0)
-                st.download_button(
-                    "Télécharger les PDFs (zip)", pdf_zip,
-                    file_name="audit_pdfs_gantt.zip", mime="application/zip",
-                    use_container_width=True,
-                )
 
 
 @st.fragment(run_every="2s")
@@ -3464,7 +3484,7 @@ def audit_render_rda_cutting_controls(result: dict) -> None:
                         key="audit_rda_cutting_download",
                         use_container_width=True,
                     )
-                    st.caption("Le zip contient l'RDA ajusté et le dossier PDF_Day_Charts_Before_Cut avec seulement les jours modifiés.")
+                    st.caption("Le zip contient l'RDA ajusté et le dossier Cut_Adjusted_RDA/PDF_Day_Charts_Before_Cut avec seulement les jours modifiés.")
                 else:
                     excel_bytes = cutting.get("excel_bytes")
                     if excel_bytes:
@@ -3649,8 +3669,6 @@ def render_audit_dashboard(result: dict) -> None:
         audit_render_pdf_controls_live(result)
     else:
         audit_render_pdf_controls(result)
-
-    audit_render_rda_cutting_controls(result)
 
     # --- In-UI Gantt viewer ---
     chart_data = st.session_state.get("latest_audit_chart_data")
@@ -3916,7 +3934,7 @@ def render_audit_task() -> None:
     include_ltr = st.checkbox(
         "Inclure les contrôles LTR",
         key="audit_include_ltr",
-        help="Utilise le même fichier RDA et le même mapping. Le classeur LTR complet est ajouté au dossier de sortie et au package ZIP, quelle que soit la plage de dates PDF.",
+        help="Utilise le même fichier RDA et le même mapping. La période sélectionnée filtre les résultats LTR. Le fichier RDA complet reste utilisé pour les calculs historiques sur deux semaines.",
     )
 
     upload_cols = st.columns(4)
@@ -3931,7 +3949,7 @@ def render_audit_task() -> None:
     if choose_specific_dates:
         previous_monday, previous_sunday = audit_previous_full_week()
         pdf_date_range = option_cols[1].date_input(
-            "Dates à inclure dans les PDFs",
+            "Période de tous les contrôles et exports",
             value=(previous_monday, previous_sunday),
             key="audit_pdf_date_range",
         )
@@ -3950,7 +3968,19 @@ def render_audit_task() -> None:
         run_audit = st.button("Commencer la génération", type="primary", disabled=not all_uploaded or invalid_pdf_dates, width="stretch")
 
     if invalid_pdf_dates:
-        st.error("La plage de dates PDF doit contenir une date de début et une date de fin valides.")
+        st.error("La période doit contenir une date de début et une date de fin valides.")
+
+    if include_ltr and choose_specific_dates and not invalid_pdf_dates and rda_file is not None:
+        try:
+            rda_preview = read_csv_flex(BytesIO(rda_file.getvalue())) if rda_file.name.lower().endswith(".csv") else audit_pick_best_sheet(
+                rda_file.getvalue(), [["Jour", "Date", "date"], ["No collaborateur", "No Collaborateur", "Employee No", "no_collaborateur"]]
+            )[1]
+            date_col = rda_pick_col(rda_preview, ["Jour", "Date", "date"])
+            if date_col:
+                for warning in ltr_history_warnings(audit_swiss_date(rda_preview[date_col]), *pdf_date_range):
+                    st.warning(warning)
+        except Exception as exc:
+            st.warning(f"Impossible de vérifier la couverture historique LTR : {exc}")
 
     if run_audit:
         render_blocking_run_warning()
@@ -3962,7 +3992,7 @@ def render_audit_task() -> None:
                     text=msg or "Audit en cours...",
                 )
 
-            result = audit_process(rda_file, wf_file, mapping_file, planning_file, progress_cb=_audit_progress)
+            result = audit_process(rda_file, wf_file, mapping_file, planning_file, progress_cb=_audit_progress, date_range=pdf_date_range if choose_specific_dates else None)
             pdf_include_pairs = None
             if choose_specific_dates:
                 pdf_start, pdf_end = pdf_date_range
@@ -3998,10 +4028,12 @@ def render_audit_task() -> None:
                 progress.progress(0.45, text="Contrôles LTR sur le fichier RDA original...")
                 audit_excel_path = Path(result["excel_path"])
                 ltr_output_root = audit_excel_path.parent / f"LTR_Checks_{audit_excel_path.stem}"
-                ltr_result = ltr_process(mapping_file, rda_file, output_root=ltr_output_root)
+                ltr_result = ltr_process(mapping_file, rda_file, output_root=ltr_output_root, date_range=pdf_date_range if choose_specific_dates else None, exclude_incomplete_months=True)
+                for warning in ltr_result.get("warnings", []):
+                    st.warning(warning)
 
             complete_package = audit_build_complete_package(
-                result, progress_cb=_package_progress, include_pairs=pdf_include_pairs, ltr_result=ltr_result,
+                result, progress_cb=_package_progress, include_pairs=pdf_include_pairs, ltr_result=ltr_result, comparison_date_range=pdf_date_range if choose_specific_dates else None,
             )
             st.session_state["latest_audit_complete_package"] = complete_package
             st.session_state["latest_rda_cutting_result"] = complete_package.get("cutting")

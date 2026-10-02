@@ -67,6 +67,11 @@ def _identity(number, name):
     return "name:" + name
 
 
+def _valid_duration(value):
+    value = pd.to_numeric(value, errors="coerce")
+    return pd.notna(value) and math.isfinite(float(value)) and value >= 0
+
+
 def comparison_entries(result):
     names = {}
     collab_aliases = {}
@@ -83,29 +88,43 @@ def comparison_entries(result):
                ("RDA", result["rda"])]
     for source, frame in sources:
         for pos, row in enumerate(frame.to_dict("records"), 2):
+            pos = row.get("source_row", pos)
             planning = source == "Planning"
             cid = _text(row.get("collab_id"))
             number = _id(row.get("emp_nr" if planning else "collab_no_sarl"))
             name = _text(row.get("collab_name")) or names.get(cid, "")
             # Unmapped IDs are source-specific: do not invent cross-system matches.
-            key = cid or f"unmapped:{source}:{_identity(number, name) or pos}"
+            key = cid or f"unmapped:{source}:" + (f"id:{number}" if number else f"row:{pos}")
             collab_aliases.setdefault(key, set()).update(_ids([number]))
             day = row.get("date" if planning else "jour")
             day = pd.to_datetime(day, errors="coerce")
             day = day.date() if pd.notna(day) else None
-            minutes = pd.to_numeric(row.get("duration_min" if planning else "duree_min"), errors="coerce")
-            valid_minutes = pd.notna(minutes) and math.isfinite(float(minutes)) and minutes >= 0
+            duration_column = "duration_min" if planning else "duree_min"
+            noted = pd.to_numeric(row.get("noted_duration_min", row.get(duration_column)), errors="coerce")
+            start = pd.to_datetime(row.get("start"), errors="coerce")
+            end = pd.to_datetime(row.get("end"), errors="coerce")
+            calculated = (end - start).total_seconds() / 60 if pd.notna(start) and pd.notna(end) else None
+            matches = abs(noted - calculated) <= 0.01 if _valid_duration(noted) and _valid_duration(calculated) else None
+            missing_noted = pd.isna(noted)
+            fallback = missing_noted and _valid_duration(calculated)
+            minutes = calculated if fallback else noted
+            valid_minutes = _valid_duration(minutes)
+            basis = "Calculated fallback" if fallback else "Recorded" if valid_minutes else "Invalid"
             client_name = _text(row.get("client_name"))
             client_id = _id(row.get("client_nr"))
             client_main_id = client_lookup.get(client_id, "")
             client_key = "mapped:" + client_main_id if client_main_id else _identity(client_id, client_name)
             issues = []
             if not cid:
-                issues.append("Unmapped collaborator (kept separately)")
+                issues.append("Unmapped collaborator ID (unassigned)" if number else "Missing collaborator ID (unassigned)")
             if day is None:
                 issues.append("Invalid date (excluded from summaries)")
             if not valid_minutes:
                 issues.append("Invalid duration (excluded from minutes)")
+            if matches is False:
+                issues.append("Recorded duration differs from start/end")
+            if fallback:
+                issues.append("Missing recorded duration; calculated fallback used")
             if not client_key and client_name:
                 issues.append("Client identity unavailable / anonymized")
             if client_key.startswith("name:"):
@@ -116,11 +135,14 @@ def comparison_entries(result):
                 issues.append("PDF planning exclusion: " + _text(row["_drop"]))
             records.append({
                 "source": source, "source_row": pos, "date": day,
-                "collab_id": key, "collab_number": number, "collab_name": name,
+                "collab_id": key, "collab_number": number, "collab_name": name, "collab_mapped": bool(cid),
                 "client_key": client_key, "client_number": client_id, "client_name": client_name,
                 "collab_record_id": number, "client_record_id": client_id,
                 "client_main_id": client_main_id,
                 "client_all_ids": _id_list(client_ids.get(client_main_id, {client_id})),
+                "noted_duration_min": float(noted) if _valid_duration(noted) else None,
+                "calculated_duration_min": float(calculated) if _valid_duration(calculated) else None,
+                "duration_matches": matches, "duration_basis": basis,
                 "minutes": float(minutes) if valid_minutes else None,
                 "hours": float(minutes) / 60 if valid_minutes else None,
                 "client_absent": planning and _text(row.get("client_absent")).upper() == "Y",
@@ -132,9 +154,10 @@ def comparison_entries(result):
     for row in records:
         row["collab_all_ids"] = _id_list(collab_aliases.get(row["collab_id"], set()))
     return pd.DataFrame(records, columns=[
-        "source", "source_row", "date", "collab_id", "collab_number", "collab_name",
+        "source", "source_row", "date", "collab_id", "collab_number", "collab_name", "collab_mapped",
         "client_key", "client_number", "client_name", "collab_all_ids", "collab_record_id",
-        "client_main_id", "client_all_ids", "client_record_id", "minutes", "hours", "client_absent",
+        "client_main_id", "client_all_ids", "client_record_id", "noted_duration_min",
+        "calculated_duration_min", "duration_matches", "duration_basis", "minutes", "hours", "client_absent",
         "activity", "activity_label", "planning_type", "issues"])
 
 
@@ -154,7 +177,8 @@ def summarize(entries, keys):
         "difference_hours", "difference_pct", "planned_clients", "rda_clients",
         "matched_clients", "planned_only_clients", "rda_only_clients", "client_counts_match",
         "client_sets_match", "planned_unidentified_rows", "rda_unidentified_rows",
-        "invalid_duration_rows", "coverage"]
+        "invalid_duration_rows", "planned_noted_min", "rda_noted_min", "planned_fallback_rows",
+        "planned_fallback_min", "rda_fallback_rows", "rda_fallback_min", "duration_mismatch_rows", "coverage"]
     records = []
     groups = entries.groupby(list(keys), dropna=False, sort=True) if keys else [((), entries)]
     for key, group in groups:
@@ -186,19 +210,33 @@ def summarize(entries, keys):
             "planned_unidentified_rows": int(p.client_key.eq("").sum()),
             "rda_unidentified_rows": int(r.client_key.eq("").sum()),
             "invalid_duration_rows": int(group.minutes.isna().sum()),
+            "planned_noted_min": p.noted_duration_min.sum(),
+            "rda_noted_min": r.noted_duration_min.sum(),
+            "planned_fallback_rows": int(p.duration_basis.eq("Calculated fallback").sum()),
+            "planned_fallback_min": p.loc[p.duration_basis.eq("Calculated fallback"), "minutes"].sum(),
+            "rda_fallback_rows": int(r.duration_basis.eq("Calculated fallback").sum()),
+            "rda_fallback_min": r.loc[r.duration_basis.eq("Calculated fallback"), "minutes"].sum(),
+            "duration_mismatch_rows": int(group.duration_matches.eq(False).sum()),
             "coverage": "Both" if len(p) and len(r) else "Planning only" if len(p) else "RDA only",
         })
     return pd.DataFrame(records, columns=columns)
 
 
-def build_comparison_tables(result):
+def build_comparison_tables(result, date_range=None):
     entries = comparison_entries(result)
+    if date_range is not None:
+        start, end = (pd.Timestamp(value).date() for value in date_range)
+        if start > end:
+            raise ValueError("Comparison start date must precede end date")
+        entries = entries[entries.date.notna() & entries.date.between(start, end)].copy()
     valid = entries[entries.date.notna()].copy()
+    mapped = valid[valid.collab_mapped.astype(bool)]
     clients = valid[valid.client_key.ne("")]
-    active = clients[~clients.client_absent.astype(bool)]
+    mapped_clients = clients[clients.collab_mapped.astype(bool)]
+    active = mapped_clients[~mapped_clients.client_absent.astype(bool)]
     notes = [
-        ("Purpose", "Compare planning with original recorded RDA, before cutting; all uploaded dates, independent of PDF selection."),
-        ("Time", "Sum of recorded duration in minutes (hours = minutes / 60), not elapsed shift span. RDA is recorded time, not independently verified work."),
+        ("Purpose", "Compare planning with original recorded RDA, before cutting; all uploaded dates unless the main audit date range is selected."),
+        ("Time", "Sum of normalized duration in minutes (hours = minutes / 60), not elapsed shift span. RDA is recorded time, not independently verified work."),
         ("Difference", "RDA minus planning; positive = more recorded than planned. Percentage is blank when planned minutes are zero."),
         ("Overall / Daily / Collaborators", "All activities, including travel and activities without a client. One-sided dates/collaborators remain visible."),
         ("Client_Time", "Only rows with an identifiable client; includes absent-client planning. Active_Client_Time excludes planning rows marked client_absent=Y."),
@@ -215,32 +253,41 @@ def build_comparison_tables(result):
         ("Duplicates / overlaps", "Rows are not deduplicated; overlapping service durations can add up beyond clock time. Row counts represent entries, not visits."),
         ("Source rows", "Entries source_row is the data row + header in the selected source sheet. Personal contact details and free-text care notes are not exported."),
     ]
-    daily = summarize(valid, ["date", "collab_id"])
+    daily = summarize(mapped, ["date", "collab_id"])
     tables = {
         "Read_Me": pd.DataFrame(notes, columns=["Topic", "Definition"]),
         "Overall": summarize(valid, []),
         "Daily": summarize(valid, ["date"]),
-        "Collaborators": summarize(valid, ["collab_id"]),
+        "Collaborators": summarize(mapped, ["collab_id"]),
         "Day_Collaborator": daily,
-        "Client_Time": summarize(clients, ["date", "collab_id"]),
+        "Client_Time": summarize(mapped_clients, ["date", "collab_id"]),
         "Active_Client_Time": summarize(active, ["date", "collab_id"]),
         "Clients": summarize(clients, ["client_key"]),
-        "Client_Detail": summarize(clients, ["date", "collab_id", "client_key"]),
+        "Client_Detail": summarize(mapped_clients, ["date", "collab_id", "client_key"]),
         "Exceptions": daily[(daily.difference_min.abs() > 0.01) | ~daily.client_sets_match |
-                            daily.coverage.ne("Both") | daily.invalid_duration_rows.gt(0)].copy(),
+                            daily.coverage.ne("Both") | daily.invalid_duration_rows.gt(0) | daily.duration_mismatch_rows.gt(0)].copy(),
         "Activities": valid.groupby(["source", "activity", "activity_label", "planning_type"], dropna=False).agg(
             rows=("source", "size"), minutes=("minutes", "sum"), hours=("hours", "sum")).reset_index(),
         "Absences": entries[entries.client_absent.astype(bool)].copy(),
         "Data_Quality": entries[entries.issues.ne("")].copy(),
+        "Unassigned": entries[~entries.collab_mapped.astype(bool)].copy(),
         "Entries": entries,
     }
+    notes_extra = [
+        ("Duration check", "Recorded duration takes priority; calculated start/end duration is checked with tolerance 0.01 minute. Missing recorded duration falls back to valid calculated time; invalid negative durations do not."),
+        ("Collaborator scope", "Collaborator and day/collaborator detail sheets include mapped collaborators only. Unassigned retains missing/unmapped IDs. Overall, Daily, Clients and Entries include all rows."),
+        ("Reconciliation", "planned_min = planned_noted_min + planned_fallback_min; rda_min = rda_noted_min + rda_fallback_min."),
+    ]
+    tables["Read_Me"] = pd.concat([tables["Read_Me"], pd.DataFrame(notes_extra, columns=["Topic", "Definition"])], ignore_index=True)
+    if date_range is not None:
+        tables["Read_Me"].loc[0, "Definition"] = f"Compare planning with original recorded RDA, before cutting; selected dates {start} through {end} (inclusive)."
     return tables
 
 
-def build_comparison_workbook(result):
+def build_comparison_workbook(result, date_range=None):
     output = BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        for title, frame in build_comparison_tables(result).items():
+        for title, frame in build_comparison_tables(result, date_range=date_range).items():
             frame.to_excel(writer, sheet_name=title, index=False)
             sheet = writer.sheets[title]
             sheet.freeze_panes = "A2"
