@@ -3,6 +3,7 @@ from ui_common import read_csv_flex, render_blocking_run_warning, render_downloa
 
 import posixpath
 import shutil
+from openpyxl.cell.cell import ILLEGAL_CHARACTERS_RE
 
 try:
     import paramiko
@@ -260,7 +261,7 @@ def download_sftp_files_as_zip(
     buffer.seek(0)
     return buffer.getvalue(), errors
 
-def create_merged_planning_csv_bytes(paths: list[Path]) -> bytes:
+def create_merged_planning_df(paths: list[Path]) -> pd.DataFrame:
     frames = []
     for path in paths:
         df = read_csv_flex(path)
@@ -271,29 +272,48 @@ def create_merged_planning_csv_bytes(paths: list[Path]) -> bytes:
         frames.append(df)
 
     if not frames:
-        return b""
+        return pd.DataFrame()
 
-    merged = pd.concat(frames, ignore_index=True, sort=False)
+    return pd.concat(frames, ignore_index=True, sort=False)
+
+
+def create_merged_planning_csv_bytes(paths: list[Path]) -> bytes:
+    merged = create_merged_planning_df(paths)
+    if merged.empty and not len(merged.columns):
+        return b""
     return merged.to_csv(index=False, encoding="utf-8-sig", sep=";").encode("utf-8-sig")
+
+
+def create_merged_planning_excel_bytes(paths: list[Path]) -> bytes:
+    merged = create_merged_planning_df(paths)
+
+    def excel_safe(value):
+        return ILLEGAL_CHARACTERS_RE.sub("", value) if isinstance(value, str) else value
+
+    # Excel rejects some invisible control characters present in source CSVs.
+    merged = merged.apply(lambda column: column.map(excel_safe))
+    merged.columns = [excel_safe(column) for column in merged.columns]
+    buffer = BytesIO()
+    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+        merged.to_excel(writer, sheet_name="Planning", index=False)
+    return buffer.getvalue()
 
 
 def render_planning_download_task() -> None:
     st.title("Téléchargement planning")
     st.caption("Télécharge les fichiers planning CSV depuis le serveur SFTP.")
-    st.info("Note: la date dans le nom du fichier correspond à la date planning + 1 jour.")
-
-    today = date.today()
-    date_cols = st.columns(2)
-    from_planning_date = date_cols[0].date_input("Date planning de début", value=today)
-    to_planning_date = date_cols[1].date_input("Date planning de fin", value=today)
 
     with st.expander("Serveur SFTP", expanded=True):
         server_cols = st.columns(4)
         host = server_cols[0].text_input("SFTP host", value=DEFAULT_SFTP_HOST)
         port = server_cols[1].number_input("SFTP port", min_value=1, max_value=65535, value=DEFAULT_SFTP_PORT)
         username = server_cols[2].text_input("SFTP username", value=DEFAULT_SFTP_USERNAME)
-        password = server_cols[3].text_input("SFTP password", type="password")
-        st.caption(f"Dossier distant utilisé automatiquement: {REMOTE_ROOT}.")
+        password = server_cols[3].text_input("SFTP password", value=".LFior4aFwhs@rNRvrE-fBsC", type="password")
+
+        today = date.today()
+        date_cols = st.columns(2)
+        from_planning_date = date_cols[0].date_input("Date planning de début", value=today)
+        to_planning_date = date_cols[1].date_input("Date planning de fin", value=today)
 
     if from_planning_date > to_planning_date:
         st.error("La date de début doit être antérieure ou égale à la date de fin.")
@@ -301,6 +321,7 @@ def render_planning_download_task() -> None:
 
     snapshot_dates = planning_range_to_snapshot_dates(from_planning_date, to_planning_date)
     st.caption("Dates recherchées dans les noms de fichiers: " + ", ".join(snapshot_dates))
+    st.caption("Note: la date dans le nom du fichier correspond à la date planning + 1 jour.")
 
     selected_prefixes = st.multiselect(
         "Sources",
@@ -308,6 +329,7 @@ def render_planning_download_task() -> None:
         default=list(DEFAULT_PLANNING_PREFIXES),
         help="Filtre optionnel selon les préfixes à chercher sur le serveur.",
     )
+
 
     if st.button("Rechercher et préparer les plannings sélectionnés", type="primary", width="stretch"):
         render_blocking_run_warning()
@@ -324,7 +346,6 @@ def render_planning_download_task() -> None:
         server_total_count = 0
         server_planning_files = []
         progress.progress(10, text="Préparation de la connexion serveur...")
-        st.caption(f"Dossier de téléchargement créé automatiquement: {download_folder}")
 
         ready_for_sftp = sftp_fields_ready(host, int(port), username, password)
         if ready_for_sftp:
@@ -507,6 +528,14 @@ def render_planning_download_task() -> None:
             file_name=f"planning_merged_{result['from_planning_date']}_to_{result['to_planning_date']}.csv",
             mime="text/csv",
             key="planning_download_merged_csv",
+        )
+
+        st.download_button(
+            "Télécharger les fichiers sélectionnés fusionnés en un Excel",
+            create_merged_planning_excel_bytes(available_paths),
+            file_name=f"planning_merged_{result['from_planning_date']}_to_{result['to_planning_date']}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key="planning_download_merged_excel",
         )
 
         st.caption(

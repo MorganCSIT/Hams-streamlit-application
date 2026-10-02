@@ -779,7 +779,7 @@ def render_dashboard(csv_path: Path) -> None:
 
 
 def render_webfleet_task() -> None:
-    st.title("Téléchargement des journaux Webfleet")
+    st.title("Téléchargement Webfleet")
 
     default_output = get_session_output_root("WebfleetReports")
 
@@ -787,7 +787,7 @@ def render_webfleet_task() -> None:
         api_cols = st.columns(4)
         account = api_cols[0].text_input("Compte", value="assistance-services")
         username = api_cols[1].text_input("Utilisateur", value="mkieffer@homeassistance.ch")
-        password = api_cols[2].text_input("Mot de passe", type="password")
+        password = api_cols[2].text_input("Mot de passe", value="Hams2026!", type="password")
         api_key = api_cols[3].text_input("Clé API", value="bcf52711-e006-43c1-bee7-4f29e1616314", type="password")
         today = date.today()
         date_cols = st.columns(2)

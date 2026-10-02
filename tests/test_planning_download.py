@@ -1,4 +1,6 @@
 import unittest
+from io import BytesIO
+import pandas as pd
 from datetime import date
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -7,6 +9,7 @@ from planning_download import (
     PlanningFile,
     choose_latest_files,
     create_merged_planning_csv_bytes,
+    create_merged_planning_excel_bytes,
     get_planning_archive_folder,
     get_planning_archive_folders,
     get_planning_source_options,
@@ -66,6 +69,19 @@ class PlanningDownloadTests(unittest.TestCase):
         self.assertIn("source_file;planning_date;name;value", merged)
         self.assertIn("HAS_HAM_20260701_2330_PEPS-Visits.csv;2026-06-30;one;1", merged)
         self.assertIn("HAS_HAM_20260702_2330_PEPS-Visits.csv;2026-07-01;two;2", merged)
+
+    def test_excel_removes_illegal_controls_and_preserves_valid_text(self):
+        with TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "HAS_HAM_20260701_2330_PEPS-Visits.csv"
+            path.write_text('name;value\n"Douche\x0b\x1f é\tfin\nligne";2\n', encoding="utf-8")
+            workbook = create_merged_planning_excel_bytes([path])
+            exported = pd.read_excel(BytesIO(workbook))
+            csv = create_merged_planning_csv_bytes([path]).decode("utf-8-sig")
+
+        self.assertEqual(exported.loc[0, "name"], "Douche é\tfin\nligne")
+        self.assertEqual(exported.loc[0, "value"], 2)
+        self.assertEqual(exported.loc[0, "planning_date"], "2026-06-30")
+        self.assertIn("\x0b\x1f", csv)
 
     def test_archive_folders_are_created_when_missing(self):
         with TemporaryDirectory() as tmpdir:

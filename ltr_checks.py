@@ -462,8 +462,10 @@ def ltr_zip_full_and_week(result: dict, week_workbook_path: Path, start_date: da
     return package_path
 
 
-def ltr_process(matched_upload, rda_upload) -> dict:
-    output_root = ltr_unique_output_root(ltr_generated_output_name())
+def ltr_process(matched_upload, rda_upload, output_root: Path | None = None) -> dict:
+    """Run LTR checks, optionally inside a caller-selected output folder."""
+    automatic_output_root = output_root is None
+    output_root = Path(output_root) if output_root is not None else ltr_unique_output_root(ltr_generated_output_name())
     input_dir = output_root / "inputs"
     matched_path = ltr_save_upload(matched_upload, input_dir)
     rda_path = ltr_save_upload(rda_upload, input_dir)
@@ -474,7 +476,7 @@ def ltr_process(matched_upload, rda_upload) -> dict:
 
     rda_date_range = ltr_rda_date_range(df_raw)
     desired_name = ltr_generated_output_name(rda_date_range)
-    if output_root.name != desired_name:
+    if automatic_output_root and output_root.name != desired_name:
         desired_root = output_root.with_name(desired_name)
         if desired_root.exists():
             base_root = desired_root
@@ -769,8 +771,8 @@ def render_ltr_task() -> None:
     st.caption("Exécute les contrôles LTR hybrides et crée le classeur Excel multi-feuilles avec un tableau de bord d'audit.")
 
     cols = st.columns(2)
-    matched_file = cols[0].file_uploader("Fichier mapping", type=["xlsx", "xls"], key="ltr_matched")
-    rda_file = cols[1].file_uploader("Fichier RDA", type=["xlsx", "xls", "csv"], key="ltr_rda")
+    rda_file = cols[0].file_uploader("Fichier RDA", type=["xlsx", "xls", "csv"], key="ltr_rda")
+    matched_file = cols[1].file_uploader("Fichier mapping", type=["xlsx", "xls"], key="ltr_matched")
 
     option_cols = st.columns([1.2, 2.8])
     choose_week_output = option_cols[0].checkbox("Choisir des dates spécifiques", key="ltr_choose_week_dates")
@@ -790,7 +792,7 @@ def render_ltr_task() -> None:
             and (not isinstance(week_date_range, (tuple, list)) or len(week_date_range) != 2 or week_date_range[0] > week_date_range[1])
         )
         run_ltr = st.button(
-            "Lancer les contrôles LTR",
+            "Commencer la génération",
             type="primary",
             disabled=matched_file is None or rda_file is None or invalid_week_dates,
             width="stretch",

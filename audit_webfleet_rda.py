@@ -2,6 +2,7 @@ from app_config import *
 import concurrent.futures
 import hashlib
 from planning_rda_comparison import build_comparison_workbook
+from ltr_checks import ltr_process
 
 from ui_common import read_csv_flex, render_blocking_run_warning
 
@@ -976,7 +977,7 @@ def audit_build_rda_cutting_package(result: dict, cutting: dict, progress_cb=Non
     }
 
 
-def audit_build_complete_package(result: dict, progress_cb=None, include_pairs: set[tuple[str, str]] | None = None) -> dict:
+def audit_build_complete_package(result: dict, progress_cb=None, include_pairs: set[tuple[str, str]] | None = None, ltr_result: dict | None = None) -> dict:
     def _prog(pct, msg):
         if progress_cb:
             progress_cb(min(max(float(pct or 0.0), 0.0), 1.0), msg)
@@ -1010,6 +1011,9 @@ def audit_build_complete_package(result: dict, progress_cb=None, include_pairs: 
     package_buf = BytesIO()
     with zipfile.ZipFile(package_buf, "w", zipfile.ZIP_DEFLATED) as zf:
         zf.writestr("Planning_RDA_Comparison/planning_rda_comparison.xlsx", comparison_bytes.getvalue())
+        if ltr_result is not None:
+            workbook_path = Path(ltr_result["workbook_path"])
+            zf.write(workbook_path, arcname=f"LTR_Checks/{workbook_path.name}")
         excel_bytes = result.get("excel_bytes")
         if excel_bytes:
             excel_bytes.seek(0)
@@ -1045,6 +1049,7 @@ def audit_build_complete_package(result: dict, progress_cb=None, include_pairs: 
         "cutting": cutting,
         "cutting_package": cutting_package,
         "main_pdf_zip": main_pdf_zip,
+        "ltr_result": ltr_result,
     }
 
 
@@ -1509,7 +1514,10 @@ def audit_process(rda_file, wf_file, mapping_file, planning_file, progress_cb=No
         _, WF = audit_pick_best_sheet(wf_bytes, WF_REQUIRED)
         WF = _strip_bom(WF)
 
-    _, PLANNING = audit_pick_best_sheet(plan_bytes, PLANNING_REQUIRED)
+    if planning_file.name.lower().endswith(".csv"):
+        PLANNING = read_csv_flex(BytesIO(plan_bytes))
+    else:
+        _, PLANNING = audit_pick_best_sheet(plan_bytes, PLANNING_REQUIRED)
     PLANNING = _strip_bom(PLANNING)
 
     map_sheets = pd.read_excel(BytesIO(map_bytes), sheet_name=None)
@@ -3902,14 +3910,20 @@ def render_audit_dashboard(result: dict) -> None:
 # ============================================================
 
 def render_audit_task() -> None:
-    st.title("Audit Webfleet-RDA")
+    st.title("Audit Webfleet-RDA-Planning")
     st.caption("Croise les données Webfleet, RDA et planning pour détecter les usages suspects du véhicule de fonction.")
+
+    include_ltr = st.checkbox(
+        "Inclure les contrôles LTR",
+        key="audit_include_ltr",
+        help="Utilise le même fichier RDA et le même mapping. Le classeur LTR complet est ajouté au dossier de sortie et au package ZIP, quelle que soit la plage de dates PDF.",
+    )
 
     upload_cols = st.columns(4)
     rda_file = upload_cols[0].file_uploader("Fichier RDA", type=["xlsx", "xls", "csv"], key="audit_rda")
     wf_file = upload_cols[1].file_uploader("Fichier Webfleet", type=["xlsx", "xls", "csv"], key="audit_wf")
-    mapping_file = upload_cols[2].file_uploader("Fichier Mapping", type=["xlsx", "xls"], key="audit_map")
-    planning_file = upload_cols[3].file_uploader("Fichier Planning", type=["xlsx", "xls"], key="audit_plan")
+    planning_file = upload_cols[2].file_uploader("Fichier Planning", type=["xlsx", "xls", "csv"], key="audit_plan")
+    mapping_file = upload_cols[3].file_uploader("Fichier Mapping", type=["xlsx", "xls"], key="audit_map")
 
     option_cols = st.columns([1.2, 2.8])
     choose_specific_dates = option_cols[0].checkbox("Choisir des dates spécifiques", key="audit_choose_pdf_dates")
@@ -3933,7 +3947,7 @@ def render_audit_task() -> None:
             choose_specific_dates
             and (not isinstance(pdf_date_range, (tuple, list)) or len(pdf_date_range) != 2 or pdf_date_range[0] > pdf_date_range[1])
         )
-        run_audit = st.button("Lancer l'audit", type="primary", disabled=not all_uploaded or invalid_pdf_dates, width="stretch")
+        run_audit = st.button("Commencer la génération", type="primary", disabled=not all_uploaded or invalid_pdf_dates, width="stretch")
 
     if invalid_pdf_dates:
         st.error("La plage de dates PDF doit contenir une date de début et une date de fin valides.")
@@ -3979,7 +3993,16 @@ def render_audit_task() -> None:
                     text=msg or "Génération du package complet...",
                 )
 
-            complete_package = audit_build_complete_package(result, progress_cb=_package_progress, include_pairs=pdf_include_pairs)
+            ltr_result = None
+            if include_ltr:
+                progress.progress(0.45, text="Contrôles LTR sur le fichier RDA original...")
+                audit_excel_path = Path(result["excel_path"])
+                ltr_output_root = audit_excel_path.parent / f"LTR_Checks_{audit_excel_path.stem}"
+                ltr_result = ltr_process(mapping_file, rda_file, output_root=ltr_output_root)
+
+            complete_package = audit_build_complete_package(
+                result, progress_cb=_package_progress, include_pairs=pdf_include_pairs, ltr_result=ltr_result,
+            )
             st.session_state["latest_audit_complete_package"] = complete_package
             st.session_state["latest_rda_cutting_result"] = complete_package.get("cutting")
             st.session_state["latest_rda_cutting_package"] = complete_package.get("cutting_package")
@@ -3996,7 +4019,7 @@ def render_audit_task() -> None:
             zip_bytes = complete_package["zip_bytes"]
             zip_bytes.seek(0)
             st.download_button(
-                "Télécharger le package complet",
+                "Télécharger le classeur complet",
                 zip_bytes,
                 file_name=complete_package.get("download_name", "audit_webfleet_rda_complete.zip"),
                 mime=complete_package.get("output_mime", "application/zip"),
@@ -4004,11 +4027,13 @@ def render_audit_task() -> None:
                 width="stretch",
             )
         else:
-            st.button("Télécharger le package complet", disabled=True, key="audit_complete_package_placeholder", width="stretch")
+            st.button("Télécharger le classeur complet", disabled=True, key="audit_complete_package_placeholder", width="stretch")
 
     if result:
         if complete_package:
             st.success("Audit, PDFs Gantt, RDA cutting et comparaison Planning / RDA terminés. Le package complet inclut le dossier Planning_RDA_Comparison et son Excel exploratoire.")
+            if complete_package.get("ltr_result") is not None:
+                st.success("Contrôles LTR terminés. Le classeur est inclus dans le dossier de sortie et dans le dossier LTR_Checks du package complet.")
         else:
             st.success("Rapport Excel créé.")
         render_audit_dashboard(result)

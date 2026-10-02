@@ -111,7 +111,7 @@ TASKS = {
     "planning": "Téléchargement planning",
     "merge": "Fusionner des fichiers",
     "ltr": "Contrôles LTR",
-    "audit": "Audit Webfleet-RDA",
+    "audit": "Audit Webfleet-RDA-Planning",
 }
 RDA_OE_MAP = {
     "NE 301": "100000000000000301",
